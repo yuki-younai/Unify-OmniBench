@@ -1,0 +1,14 @@
+# 统一数据集根目录（Unify-OmniBench 转换后的数据存放位置）。
+# 每个 benchmark 只需相对这个根目录写 json 文件名，media 路径也相对这个根目录。
+root: /apdcephfs_hldy/share_304318596/weiyangguo/Datasets/Unify-OmniBench
+
+datasets:
+  omnibench:
+    data_file: data/omnibench.json
+    modality: av
+  daily_omni:
+    data_file: data/daily_omni.json
+    modality: av
+  omnivideobench:
+    data_file: data/omnivideobench.json
+    modality: av

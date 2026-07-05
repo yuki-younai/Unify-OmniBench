@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "unify-omnibench"
+version = "0.1.0"
+description = "Unified evaluation framework for multimodal Omni benchmarks (Daily-Omni, OmniBench, OmniVideoBench, ...)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Agent-Omni Team" }]
+dependencies = [
+    "pyyaml>=6.0",
+    "tqdm>=4.65",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+api = [
+    "openai>=1.30",
+    "google-genai>=0.3",
+]
+local = [
+    "torch>=2.1",
+    "transformers>=4.45",
+    "opencv-python>=4.8",
+    "librosa>=0.10",
+    "soundfile>=0.12",
+]
+vllm = [
+    "vllm>=0.6.0",
+]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["unify_omnibench*"]
+exclude = ["tests*", "runs*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

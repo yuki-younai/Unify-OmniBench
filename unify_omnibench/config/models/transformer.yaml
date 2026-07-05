@@ -1,0 +1,9 @@
+# Local HuggingFace Transformers Qwen2.5-Omni.
+# device_map=auto spreads the model across all visible GPUs automatically.
+# Increase batch_size in eval.sh WORKERS to process multiple samples per forward pass.
+name: transformers_qwen25omni
+model_name_or_path: Qwen/Qwen2.5-Omni-7B
+device: auto
+attn_implementation: flash_attention_2
+torch_dtype: bfloat16
+concurrency_mode: batch

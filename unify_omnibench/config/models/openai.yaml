@@ -1,0 +1,26 @@
+# Standard OpenAI-compatible API backend.
+#   服务端: bash vllm_deploy.sh (纯 vLLM，非 vllm-omni)
+#   也支持 GPT-4o 等公有云 API (设 api_key 或 $OPENAI_API_KEY)
+#   如果需要连 vllm-omni (--omni) 多阶段 server，请用 openai_omni.yaml
+name: openai_chat
+model: Qwen2.5-Omni-7B
+base_url: http://localhost:8001/v1
+system_prompt: "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, capable of perceiving auditory and visual inputs, as well as generating text and speech."
+video:
+  mode: video_mp4
+  num_frames: 128         # vllm_deploy.sh 服务端 --media-io-kwargs 默认值；
+                          # openai_chat.py 会通过 extra_body.media_io_kwargs 逐请求动态覆盖为
+                          # probe_video_frame_count() 算出的时长自适应帧数（对齐 transformer 的
+                          # smart_nframes），这里的 128 仅作为探测失败时的兜底值。
+  fps: 2                  # 显式写入 extra_body.mm_processor_kwargs.fps（Qwen2_5OmniProcessor
+                          # 计算视频时序位置编码 second_per_grid_ts 唯一认的输入通道），
+                          # 需跟 vllm_deploy.sh --media-io-kwargs 里的 fps 一致。
+audio:
+  mode: audio_url         # 独立发送 16kHz wav，对齐 transformer 后端
+use_audio_in_video: false # 对齐 transformer 参照后端（硬编码 False）
+retry:
+  max_retries: 3
+  base_delay: 2.0
+modalities: ["text"]
+concurrency_mode: thread
+sampling: {}              # 可选覆盖标准请求字段，如 {temperature: 0.0, top_p: 1.0, repetition_penalty: 1.0}

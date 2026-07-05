@@ -1,0 +1,24 @@
+# vllm-omni (--omni) 多阶段 pipeline 后端
+#   服务端: bash vllm_omni_deploy.sh
+#   与 openai.yaml 的核心区别：vllm-omni 的 serving layer 无视标准
+#   temperature/max_tokens 字段，只认 extra_body.sampling_params_list，
+#   所以 backend 代码里需要显式按 stage 数量发采样参数。
+name: openai_omni
+model: Qwen2.5-Omni-7B
+base_url: http://localhost:8001/v1
+system_prompt: "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, capable of perceiving auditory and visual inputs, as well as generating text and speech."
+video:
+  mode: video_mp4
+  num_frames: 128
+  fps: 2
+audio:
+  mode: audio_url
+use_audio_in_video: false
+retry:
+  max_retries: 3
+  base_delay: 2.0
+modalities: ["text"]
+concurrency_mode: thread
+num_stages: 1            # 需跟 vllm_stage_textonly.yaml 里 stage_args 的条目数一致
+                          # （当前只有 thinker 一个 stage，文本模式跳过 talker/code2wav）
+sampling: {}              # 可选覆盖采样参数，如 {repetition_penalty: 1.0, top_p: 1.0}

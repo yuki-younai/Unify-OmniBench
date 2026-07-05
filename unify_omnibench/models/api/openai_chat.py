@@ -1,0 +1,353 @@
+"""OpenAI-compatible chat models.
+
+Two backends registered in this module:
+
+  ``openai_chat`` — plain ``vllm serve`` / GPT-4o / any standard
+      OpenAI-compatible gateway.  Uses ONLY standard
+      ChatCompletionRequest fields (temperature/max_tokens/top_p +
+      documented ``mm_processor_kwargs``/``media_io_kwargs`` extras).
+
+  ``openai_omni`` — vllm-omni ``--omni`` multi-stage server.
+      vllm-omni's serving layer ignores standard temperature/max_tokens
+      entirely for pipelined (Omni) models and only honors
+      ``extra_body.sampling_params_list``.  This backend explicitly
+      sets per-stage sampling params to match the transformer/vllm-offline
+      baselines (repetition_penalty=1.0, temperature=0, etc.).
+"""
+from __future__ import annotations
+
+import os
+from typing import Any, Dict, List, Optional
+
+from openai import OpenAI
+
+from ...core.registry import register_model
+from ...core.types import InferenceRequest, MediaRef
+from ...prompt.media import media_description
+from ...prompt.templates import PromptTemplate, OPENAI_DEFAULT
+from ...utils.video_io import (
+    encode_audio_data_url_16k,
+    encode_file_base64,
+    extract_frames_base64,
+    extract_qwen_native_frames_base64,
+    probe_video_frame_count,
+)
+from ...utils.logging import get_logger
+from ...utils.retry import retry
+from ..base import BaseModel
+
+log = get_logger(__name__)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Shared base — all media encoding / message building logic lives here
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class _BaseOpenAIChatModel(BaseModel):
+    """Shared logic for OpenAI-compatible chat backends.
+
+    Concrete subclasses only need to override ``_init_backend_specific``
+    (for backend-specific config parsing) and ``_apply_sampling_overrides``
+    (for backend-specific sampling parameter injection into the request).
+    """
+
+    supports_modalities = ("video", "image", "audio", "text")
+    is_thread_safe = True
+
+    # ── __init__ (common) ──────────────────────────────────────────
+    def __init__(self, cfg: Dict[str, Any]):
+        super().__init__(cfg)
+        self.model_name: str = cfg["model"]
+
+        base_url = cfg.get("base_url") or os.environ.get("OPENAI_BASE_URL", "http://localhost:8001/v1")
+        api_key = cfg.get("api_key") or os.environ.get("OPENAI_API_KEY", "EMPTY")
+
+        self._client = OpenAI(api_key=api_key, base_url=base_url)
+        self.prompt_template = PromptTemplate.from_config(cfg, OPENAI_DEFAULT)
+
+        vcfg = cfg.get("video", {}) or {}
+        self.seconds_per_frame = float(vcfg.get("seconds_per_frame", 0.5))
+        self.max_frames = vcfg.get("max_frames", 768)
+        self.min_frames = int(vcfg.get("min_frames", 4))
+        self.video_mode = vcfg.get("mode", "video_mp4")
+        self.video_num_frames = vcfg.get("num_frames")
+        self.video_fps = vcfg.get("fps")
+
+        acfg = cfg.get("audio", {}) or {}
+        self.audio_mode = acfg.get("mode", "audio_url")
+        self.use_audio_in_video = bool(cfg.get("use_audio_in_video", False))
+
+        self.modalities = cfg.get("modalities", ["text"])
+        self.retry_kwargs = cfg.get("retry", {}) or {}
+        self.extra_body = (cfg.get("request") or {}).get("extra_body", {}) or {}
+
+        self._init_backend_specific(cfg)
+
+    def _init_backend_specific(self, cfg: Dict[str, Any]) -> None:
+        """Hook for subclasses to parse backend-specific config fields."""
+        pass
+
+    def load(self) -> None:
+        pass  # OpenAI client is stateless
+
+    # ── media encoding (shared) ────────────────────────────────────
+    def _media_to_content(
+        self, media: List[MediaRef], modality_mode: str
+    ) -> List[Dict[str, Any]]:
+        """Convert filtered media refs to OpenAI content blocks.
+
+        NOTE on the ``num_frames``/``fps`` keys set on ``video_url`` below:
+        vLLM's ``VideoURL`` TypedDict (vllm/entrypoints/chat_utils.py) only
+        declares a ``url`` field, and its content-part parser does
+        ``.get("video_url", {}).get("url", None)`` — i.e. it discards any
+        extra keys we put here. These fields are effectively **inert** on
+        the current vLLM version; kept only in case a future vLLM version
+        adds first-class support for them (harmless no-op otherwise). The
+        actual, currently-working levers are:
+          * frame count/rate for LOADING  -> server's ``--media-io-kwargs``
+            startup default, NOT per-request.
+          * ``fps`` for TEMPORAL ENCODING (``second_per_grid_ts``) -> the
+            ``mm_processor_kwargs.fps`` set explicitly in ``generate()``
+            below, the only channel Qwen2_5OmniProcessor actually reads.
+        """
+        out: List[Dict[str, Any]] = []
+        has_video = any(mm.kind == "video" for mm in media)
+        for m in media:
+            if m.kind == "image":
+                b64 = encode_file_base64(m.path)
+                mime = m.mime or "image/jpeg"
+                out.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime};base64,{b64}"},
+                })
+            elif m.kind == "video":
+                if self.video_mode == "qwen_native":
+                    frames, achieved_fps = extract_qwen_native_frames_base64(
+                        m.path,
+                        fps=float(self.video_fps or (1.0 / self.seconds_per_frame if self.seconds_per_frame > 0 else 2.0)),
+                        min_frames=self.min_frames,
+                        max_frames=int(self.max_frames),
+                    )
+                    url = f"data:video/jpeg;base64,{','.join(frames)}"
+                    out.append({
+                        "type": "video_url",
+                        "video_url": {"url": url, "num_frames": len(frames), "fps": achieved_fps},
+                    })
+                elif self.video_mode == "file_url":
+                    video_url: Dict[str, Any] = {"url": f"file://{os.path.abspath(m.path)}"}
+                    if self.video_num_frames is not None:
+                        video_url["num_frames"] = int(self.video_num_frames)
+                    if self.video_fps is not None:
+                        video_url["fps"] = float(self.video_fps)
+                    out.append({"type": "video_url", "video_url": video_url})
+                elif self.video_mode == "video_mp4":
+                    ext = os.path.splitext(m.path)[1].lower().lstrip(".")
+                    mime = f"video/{ext}" if ext else "video/mp4"
+                    b64 = encode_file_base64(m.path)
+                    video_url = {"url": f"data:{mime};base64,{b64}"}
+                    if self.video_num_frames is not None:
+                        video_url["num_frames"] = int(self.video_num_frames)
+                    if self.video_fps is not None:
+                        video_url["fps"] = float(self.video_fps)
+                    out.append({"type": "video_url", "video_url": video_url})
+                elif self.video_mode == "video_data_url":
+                    frames = extract_frames_base64(
+                        m.path, seconds_per_frame=self.seconds_per_frame, max_frames=int(self.max_frames))
+                    url = f"data:video/jpeg;base64,{','.join(frames)}"
+                    fps = 1.0 / self.seconds_per_frame if self.seconds_per_frame > 0 else 2.0
+                    out.append({
+                        "type": "video_url",
+                        "video_url": {"url": url, "num_frames": len(frames), "fps": fps},
+                    })
+                else:  # "frames"
+                    for fb in extract_frames_base64(m.path, self.seconds_per_frame, self.max_frames):
+                        out.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{fb}"}})
+            elif m.kind == "audio":
+                if self.audio_mode == "skip":
+                    continue
+                if self.use_audio_in_video and has_video and self.video_mode in ("video_mp4", "file_url"):
+                    continue
+                data_url = encode_audio_data_url_16k(m.path)
+                if self.audio_mode == "audio_url":
+                    out.append({"type": "audio_url", "audio_url": {"url": data_url}})
+                else:
+                    b64 = data_url.split(",", 1)[1]
+                    out.append({"type": "input_audio", "input_audio": {"data": b64, "format": "wav"}})
+        return out
+
+    def _media_refs_for_mode(self, sample, modality_mode: str) -> List[MediaRef]:
+        if modality_mode == "text" or not sample.media:
+            return []
+        return [
+            m for m in sample.media
+            if not (
+                (modality_mode == "visual" and m.kind == "audio")
+                or (modality_mode == "audio" and m.kind in ("video", "image"))
+            )
+        ]
+
+    # ── message building (shared) ──────────────────────────────────
+    def build_messages(self, req: InferenceRequest) -> List[Dict[str, Any]]:
+        """Build OpenAI-compatible messages (system + user)."""
+        s = req.sample
+        desc = media_description(s, req.modality_mode)
+        if req.prompt_template:
+            text_prompt = req.prompt_template.format(
+                media_desc=desc,
+                question=s.question,
+                choices="\n".join(str(c) for c in s.choices),
+            )
+        else:
+            text_prompt = self.prompt_template.render(
+                media_desc=desc, question=s.question, choices=s.choices,
+            )
+        if req.modality_mode == "text" or not s.media:
+            return [
+                {"role": "system", "content": self.prompt_template.system or ""},
+                {"role": "user", "content": text_prompt},
+            ]
+        refs = self._media_refs_for_mode(s, req.modality_mode)
+        content = self._media_to_content(refs, req.modality_mode)
+        content.append({"type": "text", "text": text_prompt})
+        return [
+            {"role": "system", "content": self.prompt_template.system or ""},
+            {"role": "user", "content": content},
+        ]
+
+    # ── common pre-processing (video fps / frame count) ────────────
+    def _build_extra_body(self, req: InferenceRequest) -> Dict[str, Any]:
+        """Build extra_body with mm_processor_kwargs + media_io_kwargs."""
+        extra_body: Dict[str, Any] = dict(self.extra_body or {})
+        refs = self._media_refs_for_mode(req.sample, req.modality_mode)
+        has_video = any(m.kind == "video" for m in refs)
+        if not has_video:
+            return extra_body
+
+        has_audio = any(m.kind == "audio" for m in refs)
+        mpk = dict(extra_body.get("mm_processor_kwargs") or {})
+        if self.use_audio_in_video and has_audio and self.video_mode in ("video_mp4", "file_url"):
+            mpk["use_audio_in_video"] = True
+        if self.video_fps is not None:
+            mpk.setdefault("fps", float(self.video_fps))
+        if mpk:
+            extra_body["mm_processor_kwargs"] = mpk
+
+        if self.video_mode in ("video_mp4", "file_url"):
+            video_ref = next((m for m in refs if m.kind == "video"), None)
+            if video_ref is not None:
+                try:
+                    nframes = probe_video_frame_count(
+                        video_ref.path,
+                        target_fps=float(self.video_fps or 2.0),
+                        min_frames=self.min_frames,
+                        max_frames=int(self.max_frames),
+                    )
+                    miok = dict(extra_body.get("media_io_kwargs") or {})
+                    vio = dict(miok.get("video") or {})
+                    vio["num_frames"] = nframes
+                    vio.setdefault("fps", float(self.video_fps or 2.0))
+                    miok["video"] = vio
+                    extra_body["media_io_kwargs"] = miok
+                except Exception as e:
+                    log.warning("probe_video_frame_count(%s) failed: %s", video_ref.path, e)
+        return extra_body
+
+    # ── generate (template method) ─────────────────────────────────
+    def generate(self, req: InferenceRequest) -> str:
+        """Template method: shared flow, subclasses override sampling."""
+        messages = self.build_messages(req)
+        max_retries = int(self.retry_kwargs.get("max_retries", 3))
+        base_delay = float(self.retry_kwargs.get("base_delay", 2.0))
+        max_tokens = req.generation_kwargs.get("max_new_tokens", 10)
+
+        extra_body = self._build_extra_body(req)
+        request_kwargs = self._apply_sampling_overrides(max_tokens, extra_body)
+
+        @retry(max_retries=max_retries, base_delay=base_delay)
+        def _call() -> str:
+            completion = self._client.chat.completions.create(
+                model=self.model_name,
+                messages=messages,
+                modalities=self.modalities,
+                extra_body=extra_body or None,
+                **request_kwargs,
+            )
+            content = completion.choices[0].message.content
+            if not content:
+                raise RuntimeError("Empty response from API")
+            return content.strip()
+
+        return _call()
+
+    def _apply_sampling_overrides(self, max_tokens: int, extra_body: Dict[str, Any]) -> Dict[str, Any]:
+        """Hook: return extra kwargs for the OpenAI SDK call (temperature etc)."""
+        raise NotImplementedError("subclass must override _apply_sampling_overrides")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Backend 1: standard OpenAI-compatible (plain vLLM / GPT-4o / ...)
+# ═══════════════════════════════════════════════════════════════════════
+
+
+@register_model("openai_chat")
+class OpenAIChatModel(_BaseOpenAIChatModel):
+    """Standard OpenAI-compatible chat — plain ``vllm serve``, GPT-4o, etc.
+
+    Uses only standard ChatCompletionRequest fields (temperature, max_tokens,
+    top_p).  No vllm-omni-specific ``sampling_params_list`` workaround.
+    """
+
+    def _init_backend_specific(self, cfg: Dict[str, Any]) -> None:
+        self.sampling_overrides = cfg.get("sampling", {}) or {}
+
+    def _apply_sampling_overrides(self, max_tokens: int, extra_body: Dict[str, Any]) -> Dict[str, Any]:
+        kwargs: Dict[str, Any] = dict(
+            temperature=float(self.sampling_overrides.get("temperature", 0.0)),
+            top_p=float(self.sampling_overrides.get("top_p", 1.0)),
+            max_tokens=max_tokens,
+        )
+        if "repetition_penalty" in self.sampling_overrides:
+            extra_body["repetition_penalty"] = self.sampling_overrides["repetition_penalty"]
+        return kwargs
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Backend 2: vllm-omni ``--omni`` multi-stage server
+# ═══════════════════════════════════════════════════════════════════════
+
+
+@register_model("openai_omni")
+class OpenAIOmniChatModel(_BaseOpenAIChatModel):
+    """OpenAI-compatible chat for vllm-omni ``--omni`` multi-stage servers.
+
+    vllm-omni's serving layer (``vllm_omni/entrypoints/openai/serving_chat.py``)
+    ignores standard temperature/max_tokens/top_p fields entirely for
+    pipelined (Omni) models.  It only reads ``extra_body.sampling_params_list``,
+    falling back to each stage's YAML ``default_sampling_params`` (which
+    defaults to ``repetition_penalty=1.1``, ``max_tokens=2048`` in
+    ``vllm_stage_textonly.yaml``).  This backend explicitly sets per-stage
+    sampling params to match the transformer/vllm-offline baselines
+    (repetition_penalty=1.0, temperature=0, etc.), and sends nothing via
+    standard request fields (they would be silently ignored by the server
+    anyway).
+    """
+
+    def _init_backend_specific(self, cfg: Dict[str, Any]) -> None:
+        self.num_stages = int(cfg.get("num_stages", 1))
+        self.sampling_overrides = cfg.get("sampling", {}) or {}
+
+    def _apply_sampling_overrides(self, max_tokens: int, extra_body: Dict[str, Any]) -> Dict[str, Any]:
+        sp = {
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "top_k": -1,
+            "repetition_penalty": 1.0,
+            "max_tokens": max_tokens,
+            **self.sampling_overrides,
+        }
+        extra_body.setdefault("sampling_params_list", [dict(sp) for _ in range(self.num_stages)])
+        # Do NOT send temperature/max_tokens via standard request fields —
+        # vllm-omni ignores them for Omni models anyway.
+        return {}
+
