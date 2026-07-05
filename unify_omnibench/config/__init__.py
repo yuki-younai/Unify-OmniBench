@@ -3,13 +3,18 @@
 Layout::
 
     config/
-      generation.yaml          # shared decoding params
       dataset_config.yaml      # single file: {root, datasets: {key: {data_file, modality}}}
       models/<key>.yaml        # one file per backend
 
 To add a new benchmark, add an entry under ``datasets:`` in
 ``dataset_config.yaml`` — no Python change needed. All ``data_file`` /
 ``media_root`` are resolved relative to the single ``root`` path.
+
+Decoding params (``max_new_tokens`` / ``temperature``) no longer live in a
+YAML file — :func:`get_generation_cfg` returns a hardcoded default dict.
+Override them at the CLI via ``run.py --max-new-tokens`` / ``--temperature``
+/ ``--top-p`` (wired through ``eval.sh``'s ``MAX_NEW_TOKENS`` / ``TEMPERATURE``
+/ ``TOP_P`` variables).
 """
 from __future__ import annotations
 
@@ -21,7 +26,12 @@ import yaml
 _CFG_DIR = os.path.dirname(os.path.abspath(__file__))
 _DATASET_CONFIG_FILE = os.path.join(_CFG_DIR, "dataset_config.yaml")
 _MODELS_DIR = os.path.join(_CFG_DIR, "models")
-_GENERATION_FILE = os.path.join(_CFG_DIR, "generation.yaml")
+
+# Hardcoded decoding defaults (no longer backed by a YAML file).
+_DEFAULT_GENERATION_CFG: Dict[str, Any] = {
+    "max_new_tokens": 10,
+    "temperature": 0.0,
+}
 
 # Env-var name per backend for injecting API keys.
 _API_KEY_ENV: Dict[str, str] = {
@@ -154,9 +164,12 @@ def concurrency_for(backend: str) -> str:
 
 
 def get_generation_cfg() -> Dict[str, Any]:
-    if not os.path.exists(_GENERATION_FILE):
-        return {"max_new_tokens": 16, "temperature": 0.0}
-    return _load_yaml(_GENERATION_FILE)
+    """Return decoding defaults (max_new_tokens/temperature).
+
+    No YAML backing anymore — this is a plain hardcoded default; callers
+    (``run.py``) override individual keys via CLI flags.
+    """
+    return dict(_DEFAULT_GENERATION_CFG)
 
 
 __all__ = [

@@ -2,13 +2,21 @@
 # 每个 benchmark 只需相对这个根目录写 json 文件名，media 路径也相对这个根目录。
 root: /apdcephfs_hldy/share_304318596/weiyangguo/Datasets/Unify-OmniBench
 
+# use_audio_in_video: 按 dataset 覆盖 model yaml 里的同名全局字段（run.py 会把它
+# 合并进 model_cfg），用于对齐每个 benchmark 自己的官方参照实现：
+#   - omnibench:      无视频（image+audio），该字段不生效，写 false 仅为统一/占位
+#   - daily_omni:     对齐其 transformer 参照实现（硬编码 False，音频独立发送）
+#   - omnivideobench: 对齐其官方 qwenomni_eval.py（硬编码 True，音画按时间戳交织）
 datasets:
   omnibench:
     data_file: data/omnibench.json
     modality: av
+    use_audio_in_video: false
   daily_omni:
     data_file: data/daily_omni.json
     modality: av
+    use_audio_in_video: false
   omnivideobench:
     data_file: data/omnivideobench.json
     modality: av
+    use_audio_in_video: true

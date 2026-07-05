@@ -17,21 +17,32 @@ Usage:
 Coverage:
     use_audio_in_video wiring  — client-side only, no server needed (runs first,
                                  fails fast if av requests are built incorrectly).
-                                 Asserts whichever mode is CURRENTLY configured
-                                 (see config/models/openai.yaml):
-                                   * use_audio_in_video=false (current default —
-                                     matches the transformer reference backend's
-                                     hardcoded False): audio_url/input_audio block
-                                     MUST be present (independent audio input,
-                                     not interleaved into video's position encoding)
-                                   * use_audio_in_video=true (video_mode=video_mp4/
-                                     file_url only): audio block must be DROPPED
-                                     client-side, extra_body.mm_processor_kwargs.
-                                     use_audio_in_video must be set instead
+                                 Exercises BOTH values explicitly (two separate
+                                 model instances, see `model` / `model_av_true`
+                                 below) — NOT just whatever config/models/openai.yaml
+                                 currently has, so a regression in either branch is
+                                 always caught regardless of the live config:
+                                   * use_audio_in_video=false (matches the
+                                     transformer reference backend's hardcoded
+                                     False, see models/local/qwen25omni.py): audio_url/
+                                     input_audio block MUST be present (independent
+                                     audio input, not interleaved into video's
+                                     position encoding)
+                                   * use_audio_in_video=true (matches OmniVideoBench's
+                                     own reference, OmniVideoBench/eval/qwenomni_eval.py
+                                     hardcoded True; video_mode=video_mp4/file_url
+                                     only): audio block must be DROPPED client-side,
+                                     extra_body.mm_processor_kwargs.use_audio_in_video
+                                     must be set instead
                                    * qwen_native mode (predecoded JPEG sequence, not
                                      a real container) must ALWAYS keep the audio
                                      block regardless of use_audio_in_video (server
                                      can't extract audio from a JPEG sequence)
+    use_audio_in_video=True end-to-end — REQUIRES server; runs check_temporal_ordering
+                                 against `model_av_true` (with_audio=True) so the
+                                 server-side audio/video position-interleaving path
+                                 (get_chunked_index) actually gets exercised, not just
+                                 client-side request-building.
     temporal ordering  — REQUIRES server; ~4-5 short requests EACH on a
                          synthetically generated 30s video with objectively-
                          known event order (see check_temporal_ordering()),
@@ -95,9 +106,32 @@ model = OpenAIChatModel({
     # 天然同步（与 config/models/openai.yaml 保持一致）
     "video": {"mode": "video_mp4", "num_frames": 128, "fps": 2},
     "audio": {"mode": "audio_url"},
-    "use_audio_in_video": False,  # 对齐 openai.yaml 当前默认值
+    "use_audio_in_video": False,  # 对齐 openai.yaml 当前默认值（daily_omni/omnibench）
 })
 model.load()
+
+# Second instance, identical except use_audio_in_video=True — mirrors the
+# dataset_config.yaml override used for omnivideobench (its own reference
+# implementation, OmniVideoBench/eval/qwenomni_eval.py, hardcodes True).
+# A SEPARATE instance (not mutating `model.use_audio_in_video` in place) so
+# both branches can be exercised independently and neither test leaks state
+# into the other (mirrors how the two real datasets get two different
+# model_cfg dicts at runtime via run.py's per-dataset override).
+model_av_true = OpenAIChatModel({
+    "name": "openai_chat",
+    "model": os.environ.get("MODEL_NAME", "Qwen2.5-Omni-7B"),
+    "base_url": URL,
+    "api_key": "EMPTY",
+    "system_prompt": (
+        "You are Qwen, a virtual human developed by the Qwen Team, "
+        "Alibaba Group, capable of perceiving auditory and visual inputs, "
+        "as well as generating text and speech."
+    ),
+    "video": {"mode": "video_mp4", "num_frames": 128, "fps": 2},
+    "audio": {"mode": "audio_url"},
+    "use_audio_in_video": True,  # 对齐 omnivideobench 的 dataset_config.yaml 覆盖值
+})
+model_av_true.load()
 
 GEN_SHORT = {"temperature": 0.0, "max_new_tokens": 20}
 GEN_DESC  = {"temperature": 0.0, "max_new_tokens": 256}
@@ -136,23 +170,25 @@ def _short(content):
     return out
 
 
-def check_use_audio_in_video_wiring() -> bool:
+def check_use_audio_in_video_wiring(model_to_check) -> bool:
     """CPU-only sanity check (no HTTP call) for the use_audio_in_video +
     mm_processor_kwargs.fps wiring.
 
-    Asserts the CURRENTLY CONFIGURED behavior is actually what gets built,
-    for whichever value ``use_audio_in_video`` currently has:
+    Takes an explicit ``model_to_check`` (instead of reading a module-global)
+    so it can be called against BOTH ``model`` (use_audio_in_video=False) and
+    ``model_av_true`` (use_audio_in_video=True) — asserting the correct
+    behavior for whichever value that specific instance has:
 
       * use_audio_in_video=True  (video_mp4/file_url only): the av request
         must NOT emit a separate audio_url/input_audio block (audio is
         expected to come from the video's own track server-side), and
         extra_body.mm_processor_kwargs.use_audio_in_video must be set.
-      * use_audio_in_video=False (current default — matches the
-        transformer reference backend's hardcoded False, see
-        models/local/qwen25omni.py::build_messages): the av request MUST
-        still emit a separate audio_url/input_audio block — silently
-        dropping it here would mean the openai backend loses audio
-        entirely instead of falling back to independent audio input.
+      * use_audio_in_video=False (matches the transformer reference
+        backend's hardcoded False, see models/local/qwen25omni.py::
+        build_messages): the av request MUST still emit a separate
+        audio_url/input_audio block — silently dropping it here would
+        mean the openai backend loses audio entirely instead of falling
+        back to independent audio input.
 
     Either way, a video_url block must be present, and (whenever video is
     present) extra_body.mm_processor_kwargs.fps must be set — this is the
@@ -161,7 +197,9 @@ def check_use_audio_in_video_wiring() -> bool:
     to a hardcoded 2.0 default, which only happens to be correct by
     coincidence with our config.
     """
-    print("\n[*] use_audio_in_video + mm_processor_kwargs.fps wiring check (client-side only, no server call)")
+    model = model_to_check
+    print(f"\n[*] use_audio_in_video + mm_processor_kwargs.fps wiring check "
+          f"(use_audio_in_video={model.use_audio_in_video}, client-side only, no server call)")
     req = make_req(
         "Describe what you see and hear in this video.",
         media=[MediaRef(kind="video", path=VIDEO), MediaRef(kind="audio", path=AUDIO)],
@@ -220,16 +258,23 @@ def check_use_audio_in_video_wiring() -> bool:
     return ok
 
 
-def check_qwen_native_mode_keeps_audio() -> bool:
+def check_qwen_native_mode_keeps_audio(model_to_check) -> bool:
     """Mutual-exclusivity check: when video_mode='qwen_native' (a predecoded
     JPEG-sequence, not a real container the server can pull an audio track
     from), the audio block must NOT be skipped even if use_audio_in_video is
     True — otherwise audio would silently disappear from the request.
 
+    Takes an explicit ``model_to_check`` so this claim ("regardless of
+    use_audio_in_video") is actually verified against BOTH ``model``
+    (use_audio_in_video=False) and ``model_av_true`` (True) instead of only
+    ever exercising the False instance.
+
     Monkeypatches the (slow, real-decode) frame extractor so this only
     exercises the audio-block branch logic, not actual video decoding.
     """
-    print("\n[*] qwen_native mode must NOT drop audio (mutual-exclusivity check)")
+    model = model_to_check
+    print(f"\n[*] qwen_native mode must NOT drop audio (mutual-exclusivity check, "
+          f"use_audio_in_video={model.use_audio_in_video})")
     orig_mode = model.video_mode
     orig_extract = openai_chat_mod.extract_qwen_native_frames_base64
     openai_chat_mod.extract_qwen_native_frames_base64 = lambda *a, **kw: (["deadbeef"], 2.0)
@@ -329,7 +374,7 @@ def _mux_audio_track(video_path: str, audio_path: str, out_path: str, duration: 
     return out_path
 
 
-def check_temporal_ordering(with_audio: bool = False) -> bool:
+def check_temporal_ordering(with_audio: bool = False, model_to_use=None) -> bool:
     """Cheap, fast substitute for a full eval.sh run: sanity-check VIDEO
     TEMPORAL POSITION ENCODING using a synthetic video with objectively-known
     event order, instead of waiting ~20min for a 1200-sample Daily-Omni pass
@@ -338,22 +383,26 @@ def check_temporal_ordering(with_audio: bool = False) -> bool:
     Args:
         with_audio: if True, attach a real (content-irrelevant) audio track
             and send as ``mode="av"`` so the request also carries audio
-            media, matching the actual shape of every real Daily-Omni
-            request (which always ships both video+audio). The concrete
-            wiring this exercises depends on the model's CURRENT
-            ``use_audio_in_video`` config (see openai.yaml):
-              * False (current default, matches the transformer reference
-                backend's hardcoded False) -> audio is sent as an
+            media, matching the actual shape of every real Daily-Omni /
+            OmniVideoBench request (which always ships both video+audio).
+            The concrete wiring this exercises depends on
+            ``model_to_use.use_audio_in_video``:
+              * False (daily_omni/omnibench) -> audio is sent as an
                 INDEPENDENT block alongside video_url, NOT interleaved into
                 the video's own temporal position encoding.
-              * True -> audio is dropped client-side and
+              * True (omnivideobench) -> audio is dropped client-side and
                 mm_processor_kwargs.use_audio_in_video=True is set instead,
                 triggering server-side audio/video position-interleaving
-                (``get_chunked_index`` in Qwen2_5OmniProcessor).
+                (``get_chunked_index`` in Qwen2_5OmniProcessor). This is the
+                path that actually exercises the omnivideobench-specific
+                override end-to-end (not just client-side request shape).
             Running both the visual-only and this av variant side-by-side
             checks whether merely having audio media present in the request
             (regardless of interleaving) disturbs the video's own event
             ordering — e.g. via prompt-template/token-budget side effects.
+        model_to_use: which OpenAIChatModel instance to call generate() on.
+            Defaults to the module-global ``model`` (use_audio_in_video=False)
+            when not given; pass ``model_av_true`` to exercise the True path.
 
     Requires a running server — unlike the wiring checks above, this
     actually calls model.generate() (~4-5 short requests total per variant).
@@ -362,6 +411,7 @@ def check_temporal_ordering(with_audio: bool = False) -> bool:
         print("\n[*] Temporal ordering check SKIPPED (cv2/numpy not installed in this env)")
         return True
 
+    m = model_to_use if model_to_use is not None else model
     labels = ["APPLE", "BANANA", "CHERRY", "DURIAN", "EGGPLANT"]
     seconds_each = 6.0
     total_s = len(labels) * seconds_each
@@ -369,7 +419,7 @@ def check_temporal_ordering(with_audio: bool = False) -> bool:
     av_path = os.path.join(ROOT, "example", "_sequence_test_av.mp4")
     if with_audio:
         tag = ("video+audio (av, interleaved via use_audio_in_video=True)"
-               if model.use_audio_in_video else
+               if m.use_audio_in_video else
                "video+audio (av, audio sent independently, use_audio_in_video=False)")
     else:
         tag = "video-only (visual)"
@@ -414,7 +464,7 @@ def check_temporal_ordering(with_audio: bool = False) -> bool:
                 media.append(MediaRef(kind="audio", path=AUDIO))
                 mode = "av"
             req = make_req(question, media=media, mode=mode, gen=gen or GEN_SHORT)
-            return model.generate(req).strip()
+            return m.generate(req).strip()
 
         # 1) first / last word — cheapest, most direct probes of "does the
         #    model know WHEN in the video it is looking", i.e. is the start
@@ -496,8 +546,13 @@ def run_concurrency(label, reqs, workers):
 
 
 # ── client-side wiring checks (no server needed, run first) ─────────────
-wiring_ok = check_use_audio_in_video_wiring()
-wiring_ok = check_qwen_native_mode_keeps_audio() and wiring_ok
+# Exercise BOTH use_audio_in_video values explicitly — daily_omni/omnibench
+# (False) and omnivideobench (True) — instead of only whatever the live
+# openai.yaml config happens to have.
+wiring_ok = check_use_audio_in_video_wiring(model)
+wiring_ok = check_use_audio_in_video_wiring(model_av_true) and wiring_ok
+wiring_ok = check_qwen_native_mode_keeps_audio(model) and wiring_ok
+wiring_ok = check_qwen_native_mode_keeps_audio(model_av_true) and wiring_ok
 
 # ── warmup ─────────────────────────────────────────────────────────────
 out = model.generate(make_req("Introduce yourself in one sentence.", mode="text", gen=GEN_DESC))
@@ -505,22 +560,37 @@ print(f"[*] Warmup:\n{out}\n")
 
 # ── temporal ordering check (requires server, ~4-5 short requests per variant) ──
 try:
-    temporal_ok_visual = check_temporal_ordering(with_audio=False)
+    temporal_ok_visual = check_temporal_ordering(with_audio=False, model_to_use=model)
 except Exception as e:
     print(f"  FAIL temporal ordering check (visual): {str(e)[:200]}")
     temporal_ok_visual = False
 try:
-    temporal_ok_av = check_temporal_ordering(with_audio=True)
+    temporal_ok_av = check_temporal_ordering(with_audio=True, model_to_use=model)
 except Exception as e:
-    print(f"  FAIL temporal ordering check (av): {str(e)[:200]}")
+    print(f"  FAIL temporal ordering check (av, use_audio_in_video=False): {str(e)[:200]}")
     temporal_ok_av = False
 temporal_ok = temporal_ok_visual and temporal_ok_av
 if temporal_ok_visual and not temporal_ok_av:
-    mode_desc = "interleaving (use_audio_in_video=True)" if model.use_audio_in_video else \
-                "independent audio input (use_audio_in_video=False)"
-    print(f"\n[!] Visual-only ordering is fine but AV (with audio attached, {mode_desc}) "
-          "ordering broke — this points at the audio-attached code path specifically, "
+    print("\n[!] Visual-only ordering is fine but AV (with audio attached, "
+          "independent audio input, use_audio_in_video=False) ordering broke — "
+          "this points at the audio-attached code path specifically, "
           "NOT the raw per-video second_per_grid_ts computation.")
+
+# use_audio_in_video=True end-to-end: this is the only place that actually
+# exercises the SERVER-SIDE audio/video position-interleaving path
+# (get_chunked_index in Qwen2_5OmniProcessor) — the wiring check above only
+# verifies the CLIENT builds the request correctly, not that interleaving
+# itself produces correct temporal ordering on the server. This is exactly
+# the config omnivideobench uses (dataset_config.yaml override).
+try:
+    temporal_ok_av_true = check_temporal_ordering(with_audio=True, model_to_use=model_av_true)
+except Exception as e:
+    print(f"  FAIL temporal ordering check (av, use_audio_in_video=True): {str(e)[:200]}")
+    temporal_ok_av_true = False
+if temporal_ok_visual and not temporal_ok_av_true:
+    print("\n[!] Visual-only ordering is fine but AV with use_audio_in_video=True "
+          "(interleaved) ordering broke — this specifically affects omnivideobench, "
+          "which relies on this exact code path.")
 
 # ── serial tests ───────────────────────────────────────────────────────
 serial_cases = [
@@ -587,8 +657,10 @@ run_concurrency(
 
 # ── final summary ─────────────────────────────────────────────────────
 print("\n" + "=" * 60)
-print("use_audio_in_video / mm_processor_kwargs wiring:", "✅ 正常" if wiring_ok else "❌ 有问题（见上方 FAIL）")
-print("temporal ordering, video-only          :", "✅ 正常" if temporal_ok_visual else "❌ 有问题（见上方 FAIL）")
-print("temporal ordering, video+audio (av)    :", "✅ 正常" if temporal_ok_av else "❌ 有问题（见上方 FAIL）")
-if not (wiring_ok and temporal_ok):
+print("use_audio_in_video / mm_processor_kwargs wiring (both False & True):",
+      "✅ 正常" if wiring_ok else "❌ 有问题（见上方 FAIL）")
+print("temporal ordering, video-only                        :", "✅ 正常" if temporal_ok_visual else "❌ 有问题（见上方 FAIL）")
+print("temporal ordering, video+audio, use_audio_in_video=False:", "✅ 正常" if temporal_ok_av else "❌ 有问题（见上方 FAIL）")
+print("temporal ordering, video+audio, use_audio_in_video=True :", "✅ 正常" if temporal_ok_av_true else "❌ 有问题（见上方 FAIL，omnivideobench 会受影响）")
+if not (wiring_ok and temporal_ok and temporal_ok_av_true):
     sys.exit(1)

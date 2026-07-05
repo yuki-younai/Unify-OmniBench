@@ -1,5 +1,0 @@
-# Default decoding params (shared across backends).
-# norm mode: directly output A/B/C/D, 10 tokens is enough.
-# cot  mode: auto-override to 1024 by run.py --mode cot.
-max_new_tokens: 10
-temperature: 0.0

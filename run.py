@@ -2,7 +2,9 @@
 
 Dataset paths & per-bench modality live in ``unify_omnibench/config/datasets/``.
 Backend defaults live in ``unify_omnibench/config/models/``.
-Shared decoding params in ``unify_omnibench/config/generation.yaml``.
+Decoding defaults (max_new_tokens/temperature) are hardcoded in
+``unify_omnibench/config/__init__.py::get_generation_cfg`` and overridden via
+``--max-new-tokens`` / ``--temperature`` / ``--top-p``.
 
 Usage:
     python run.py --backend openai --dataset daily_omni \
@@ -54,9 +56,12 @@ def parse_args(argv=None) -> argparse.Namespace:
 
     p.add_argument("--workers", type=int, default=8)
     p.add_argument("--temperature", type=float, default=None,
-                   help="override generation.yaml temperature")
+                   help="override default temperature (0.0)")
     p.add_argument("--top-p", type=float, default=None, dest="top_p",
-                   help="override generation.yaml top_p")
+                   help="override default top_p")
+    p.add_argument("--max-new-tokens", type=int, default=None, dest="max_new_tokens",
+                   help="override default max_new_tokens (10); single source of "
+                        "truth for token budget — --mode no longer auto-sets this")
     p.add_argument("--vllm-gpu-mem", type=float, default=None,
                    help="override vLLM gpu_memory_utilization (default: 0.95)")
     p.add_argument("--api-url", default="",
@@ -79,14 +84,18 @@ def parse_args(argv=None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
-_COT_MAX_TOKENS = 1024  # CoT mode needs room for reasoning
-
-
 def main(argv=None) -> None:
     args = parse_args(argv)
 
     dataset_cfg = get_dataset_cfg(args.dataset)
     model_cfg = get_model_cfg(args.backend, model_path=args.model_path)
+    # dataset_config.yaml can set use_audio_in_video per dataset (flat field,
+    # sibling of data_file/modality) — it wins over the backend yaml's global
+    # default. e.g. omnivideobench needs True to match ITS OWN reference
+    # implementation (OmniVideoBench/eval/qwenomni_eval.py hardcodes True),
+    # while daily_omni/omnibench align with the transformer baseline (False).
+    if "use_audio_in_video" in dataset_cfg:
+        model_cfg["use_audio_in_video"] = dataset_cfg["use_audio_in_video"]
     if args.vllm_gpu_mem is not None and args.backend == "vllm":
         model_cfg["gpu_memory_utilization"] = args.vllm_gpu_mem
     if args.api_url:
@@ -109,12 +118,17 @@ def main(argv=None) -> None:
         gen_cfg["temperature"] = args.temperature
     if args.top_p is not None:
         gen_cfg["top_p"] = args.top_p
+    if args.max_new_tokens is not None:
+        gen_cfg["max_new_tokens"] = args.max_new_tokens
 
-    # Resolve prompt_template
+    # Resolve prompt_template.
+    # NOTE: --mode no longer auto-overrides max_new_tokens (that used to force
+    # 1024 for "cot"). Token budget is now controlled ONLY by --max-new-tokens
+    # (falling back to the hardcoded default of 10 when not passed), so the
+    # two concerns — prompt wording vs. token budget — are independent knobs.
     prompt_template = dataset_cfg.get("prompt_template")
     if args.mode == "cot":
         prompt_template = _USER_PROMPT_COT
-        gen_cfg["max_new_tokens"] = _COT_MAX_TOKENS
 
     cfg: Dict[str, Any] = {
         "run_name": f"{args.dataset}/{model_name}",
