@@ -1,22 +1,63 @@
-# 统一数据集根目录（Unify-OmniBench 转换后的数据存放位置）。
-# 每个 benchmark 只需相对这个根目录写 json 文件名，media 路径也相对这个根目录。
+# Unify-OmniBench 数据集配置。root为数据根目录；dataset下字段覆盖model yaml同名全局字段。
 root: /apdcephfs_hldy/share_304318596/weiyangguo/Datasets/Unify-OmniBench
 
-# use_audio_in_video: 按 dataset 覆盖 model yaml 里的同名全局字段（run.py 会把它
-# 合并进 model_cfg），用于对齐每个 benchmark 自己的官方参照实现：
-#   - omnibench:      无视频（image+audio），该字段不生效，写 false 仅为统一/占位
-#   - daily_omni:     对齐其 transformer 参照实现（硬编码 False，音频独立发送）
-#   - omnivideobench: 对齐其官方 qwenomni_eval.py（硬编码 True，音画按时间戳交织）
 datasets:
   omnibench:
     data_file: data/omnibench.json
     modality: av
     use_audio_in_video: false
+
   daily_omni:
     data_file: data/daily_omni.json
     modality: av
     use_audio_in_video: false
+    video:
+      fps: 2.0
+      max_frames: 768
+      min_frames: 4
+
   omnivideobench:
     data_file: data/omnivideobench.json
     modality: av
     use_audio_in_video: true
+    video:
+      fps: 2.0
+      max_frames: 256
+      min_frames: 4
+    prompt_template: |
+      You are given a video. Based on the content of the video, answer the following question:
+
+      Question:
+      {question}
+
+      Options:
+      {choices}
+
+      Answer with the option's letter directly(e.g., A, B, C, or D).If your access to the video content is limited, at least one option that is more likely than the others must be chosen.Mustn't give any other reason for can not choose!
+
+  worldsense:
+    data_file: data/worldsense.json
+    modality: av
+    # [2026-07-07] 实测确认 use_audio_in_video=True（交织模式）在 pinned
+    # vllm==0.11.0 的 V1 引擎上每条样本必现崩溃：
+    #   RuntimeError: Worker failed with error 'index 1 is out of bounds
+    #   for dimension 0 with size 1'
+    # 即 vllm_runner.py 早前标注过的 "V1 engine does not support interleaved
+    # modalities yet" 限制。改回 False + 独立 audio(.wav)（跟 Daily-Omni/
+    # OmniBench 一样、官方支持的 mixed_modalities 模式），需配合
+    # convert_worldsense.py 重新生成 worldsense.json（audio_path 不再是 None）。
+    use_audio_in_video: false
+    video:
+      fps: 2.0
+      max_frames: 256
+      min_frames: 4
+      min_pixels: 100352
+      max_pixels: 602112
+      total_pixels: 19267584
+    system_prompt: "Carefully watch this video and pay attention to every detail. Based on your observations, select the best option that accurately addresses the question."
+    prompt_template: |
+      These are the frames of a video and the corresponding audio. Select the best answer to the following multiple-choice question based on the video. Respond with only the letter (A, B, C, or D) of the correct option.
+
+      Question: {question}
+      {choices}
+      Answer: 

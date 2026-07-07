@@ -23,11 +23,13 @@ _UNIFIED_FIELDS = ("id", "question", "choices", "answer", "video_path", "audio_p
 @register_dataset("omnibench")
 @register_dataset("daily_omni")
 @register_dataset("omnivideobench")
+@register_dataset("worldsense")
 class UnifiedAdapter(BaseDatasetAdapter):
     """Load any benchmark that's been converted to the unified JSON format."""
 
     def __init__(self, cfg):
         super().__init__(cfg)
+        self.name = cfg.get("name", self.name)  # 实例属性覆盖类属性（三个装饰器共享同一个 cls.name=omnibench）
         with open(cfg["data_file"], "r", encoding="utf-8") as f:
             self.records = json.load(f)
         self.media_root = cfg.get("media_root", "")

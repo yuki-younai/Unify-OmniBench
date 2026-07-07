@@ -96,6 +96,21 @@ def main(argv=None) -> None:
     # while daily_omni/omnibench align with the transformer baseline (False).
     if "use_audio_in_video" in dataset_cfg:
         model_cfg["use_audio_in_video"] = dataset_cfg["use_audio_in_video"]
+    # dataset-level video sampling override (fps/max_frames/min_frames) — wins
+    # over the backend yaml's global default. Applied at DECODE time (baked
+    # into the video content block itself, read by qwen_omni_utils's
+    # smart_nframes) rather than post-hoc cropping after decode+resize —
+    # see dataset_config.yaml's ``video:`` comment for why this matters.
+    if "video" in dataset_cfg:
+        video_override = dict(dataset_cfg["video"] or {})
+        model_cfg_video = dict(model_cfg.get("video") or {})
+        model_cfg_video.update(video_override)
+        model_cfg["video"] = model_cfg_video
+        # keep flat max_frames in sync too (used as the post-hoc safety-net
+        # cap in qwen25omni.py::_cap_video_frames, e.g. if the installed
+        # qwen_omni_utils version ignores the per-element max_frames key)
+        if "max_frames" in video_override:
+            model_cfg["max_frames"] = int(video_override["max_frames"])
     if args.vllm_gpu_mem is not None and args.backend == "vllm":
         model_cfg["gpu_memory_utilization"] = args.vllm_gpu_mem
     if args.api_url:

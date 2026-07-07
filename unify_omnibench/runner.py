@@ -7,8 +7,6 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Set
 
-from tqdm import tqdm
-
 from .utils.progress import ProgressManager
 from .core.types import InferenceRequest, InferenceResult, Sample
 from .eval.parser import choices_to_index2ans, extract_choice_letter
@@ -211,8 +209,11 @@ class Runner:
 
     # ----- run modes
     def _run_sequential(self, pending: List[Sample]) -> None:
-        for s in tqdm(pending, desc="Sequential"):
-            self._persist(self._infer_one(s))
+        with ProgressManager(len(pending), desc="Sequential") as pm:
+            for s in pending:
+                res = self._infer_one(s)
+                self._persist(res)
+                pm.update(is_failed=bool(res.error), is_correct=bool(res.is_correct))
 
     def _run_threaded(self, pending: List[Sample]) -> None:
         W = int(self.cfg.get("concurrency", {}).get("max_workers", 8))
@@ -226,22 +227,24 @@ class Runner:
 
     def _run_batched(self, pending: List[Sample]) -> None:
         B = int(self.cfg.get("concurrency", {}).get("batch_size", 8))
-        for i in tqdm(range(0, len(pending), B), desc=f"Batch x{B}"):
-            batch = pending[i:i + B]
-            reqs = [self._build_req(s) for s in batch]
-            try:
-                raws = self.model.generate_batch(reqs)
-            except Exception as e:
-                log.warning("Batch %d failed (%s); falling back to per-sample.", i, e)
-                for s in batch:
-                    self._persist(self._infer_one(s))
-                continue
-            for s, raw in zip(batch, raws):
-                parsed = extract_choice_letter(
-                    raw, index2ans=choices_to_index2ans(s.choices)
-                )
-                self._persist(
-                    InferenceResult(
+        with ProgressManager(len(pending), desc=f"Batch x{B}") as pm:
+            for i in range(0, len(pending), B):
+                batch = pending[i:i + B]
+                reqs = [self._build_req(s) for s in batch]
+                try:
+                    raws = self.model.generate_batch(reqs)
+                except Exception as e:
+                    log.warning("Batch %d failed (%s); falling back to per-sample.", i, e)
+                    for s in batch:
+                        res = self._infer_one(s)
+                        self._persist(res)
+                        pm.update(is_failed=bool(res.error), is_correct=bool(res.is_correct))
+                    continue
+                for s, raw in zip(batch, raws):
+                    parsed = extract_choice_letter(
+                        raw, index2ans=choices_to_index2ans(s.choices)
+                    )
+                    res = InferenceResult(
                         uid=s.uid,
                         dataset=s.dataset,
                         question=s.question,
@@ -253,4 +256,5 @@ class Runner:
                                     and parsed.upper() == str(s.answer).strip().upper()),
                         meta=dict(s.meta or {}),
                     )
-                )
+                    self._persist(res)
+                    pm.update(is_failed=bool(res.error), is_correct=bool(res.is_correct))

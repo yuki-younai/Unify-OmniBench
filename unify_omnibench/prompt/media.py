@@ -97,6 +97,7 @@ def filter_media(
     modality_mode: str,
     *,
     extra_skip_kinds: tuple = (),
+    video_kwargs: Dict[str, Any] | None = None,
 ) -> List[Dict[str, Any]]:
     """Return ``{"type": kind, kind: path}`` dicts for media that should be
     passed to the model given *modality_mode*.
@@ -104,6 +105,13 @@ def filter_media(
     Audio-only mode skips **all** visual media (video + image).
     Visual-only mode skips audio.
     ``text`` mode returns an empty list.
+
+    *video_kwargs*: extra keys (e.g. ``fps``/``max_frames``/``min_frames``)
+    merged into any ``"video"`` content block. These are read directly by
+    ``qwen_omni_utils.vision_process.smart_nframes`` off the video element
+    dict itself, so setting them here caps the frame budget at DECODE time
+    (cheap) rather than after decode+resize (wasteful) — see
+    ``dataset_config.yaml``'s ``video:`` comment for context.
     """
     visual_kinds = ("video", "image")
     result: List[Dict[str, Any]] = []
@@ -116,5 +124,8 @@ def filter_media(
             continue
         if m.kind in extra_skip_kinds:
             continue
-        result.append({"type": m.kind, m.kind: m.path})
+        entry: Dict[str, Any] = {"type": m.kind, m.kind: m.path}
+        if m.kind == "video" and video_kwargs:
+            entry.update(video_kwargs)
+        result.append(entry)
     return result

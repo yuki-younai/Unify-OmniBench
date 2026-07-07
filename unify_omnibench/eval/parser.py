@@ -9,6 +9,12 @@ LETTERS = ("A", "B", "C", "D", "E", "F")  # tolerate up to 6 options; most are A
 # Pre-compiled patterns
 _JSON_ANS_RE = re.compile(r'"answer"\s*:\s*"([A-F])"', re.IGNORECASE)
 _BOXED_RE = re.compile(r"\\boxed\{(?:\\text\{)?([A-F])\}?\}", re.IGNORECASE)
+# OmniVideoBench original extract_model_answer also handles /box{X} (no backslash).
+# Unify's cascade previously missed this because the backslash-prefixed \boxed{}
+# is LaTeX-standard, but the official OmniVideoBench eval code explicitly looks
+# for both variants.  Add it as a separate step so /box{B} is treated the same as
+# \boxed{B} (both are common when the model is prompted to output /box{} format).
+_SLASH_BOX_RE = re.compile(r"/box\{(?:\\text\{)?([A-F])\}?\}", re.IGNORECASE)
 _STANDALONE_RE = re.compile(r"\b([A-F])\b")
 _PAREN_RE = re.compile(r"[\(\[\<]([A-F])[\)\]\>]", re.IGNORECASE)
 
@@ -22,11 +28,12 @@ def extract_choice_letter(
     Strategy (in order):
       1) JSON: {"answer":"X"}                          (OmniVideoBench style)
       2) \\boxed{X} / \\boxed{\\text{X}}               (OmniVideoBench CoT style)
-      3) Parenthesized letter:  (X) / [X] / <X>        (priority over reverse-lookup)
-      4) First non-space char is A-F                   (Daily-Omni style)
-      5) Option content reverse lookup via index2ans   (OmniBench style — before bare-letter
+      3) /box{X} / /box{\\text{X}}                     (OmniVideoBench slash variant)
+      4) Parenthesized letter:  (X) / [X] / <X>        (priority over reverse-lookup)
+      5) First non-space char is A-F                   (Daily-Omni style)
+      6) Option content reverse lookup via index2ans   (OmniBench style — before bare-letter
                                                         scan, otherwise "a banana" hits "A")
-      6) First standalone \\b[A-F]\\b                  (Daily-Omni fallback)
+      7) First standalone \\b[A-F]\\b                  (Daily-Omni fallback)
 
     Returns ``None`` if nothing matches.
     """
@@ -46,18 +53,23 @@ def extract_choice_letter(
     if m:
         return m.group(1).upper()
 
-    # 3) (A) [A] <A>
+    # 3) /box{X}  (OmniVideoBench slash variant — original extract_model_answer handles this)
+    m = _SLASH_BOX_RE.search(s)
+    if m:
+        return m.group(1).upper()
+
+    # 4) (A) [A] <A>
     m = _PAREN_RE.search(s)
     if m:
         return m.group(1).upper()
 
-    # 4) First char is a letter (Daily-Omni: model often outputs just "A")
+    # 5) First char is a letter (Daily-Omni: model often outputs just "A")
     first = s[0]
     if first.upper() in LETTERS and (len(s) == 1 or not s[1].isalpha()):
         # require boundary: "A" / "A." / "A)" — but NOT "Apple"
         return first.upper()
 
-    # 5) Option content reverse lookup (before bare-letter scan, so we don't
+    # 6) Option content reverse lookup (before bare-letter scan, so we don't
     #    mistake the article "a" or "I" for letters)
     if index2ans:
         s_low = s.lower()
@@ -69,7 +81,7 @@ def extract_choice_letter(
         if len(hits) == 1:
             return hits[0][0]
 
-    # 6) Standalone letter \bA\b (last-resort)
+    # 7) Standalone letter \bA\b (last-resort)
     m = _STANDALONE_RE.search(s)
     if m:
         return m.group(1).upper()

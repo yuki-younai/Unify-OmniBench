@@ -17,6 +17,13 @@ _BREAKDOWN_KEYS = (
     "video_duration",
     "duration_bucket",
     "modality_mode",
+    # WorldSense-specific dimensions (mirrors VLMEvalKit's get_dimension_rating:
+    # domain / sub_category / task_domain / audio_class / duration bucket)
+    "domain",
+    "sub_category",
+    "task_domain",
+    "audio_class",
+    "duration_category",
 )
 
 
@@ -59,9 +66,18 @@ def write_summary(items_path: str, out_dir: str, dataset_name: str) -> Dict[str,
             v = meta.get(key)
             if v is None or v == "":
                 continue
-            bk = f"{key}={v}"
-            by[bk]["n"] += 1
-            by[bk]["c"] += int(bool(x.get("is_correct")))
+            # WorldSense's audio_class is a list (e.g. ["Speech"]) — a sample
+            # can belong to multiple buckets at once, mirroring VLMEvalKit's
+            # get_dimension_rating() which does `for _audio_ctg in audio_ctg:
+            # duration_rating[...]['audio_class'][_audio_ctg].append(score)`.
+            # Scalar fields are just wrapped into a 1-item list.
+            values = v if isinstance(v, list) else [v]
+            for vv in values:
+                if vv is None or vv == "":
+                    continue
+                bk = f"{key}={vv}"
+                by[bk]["n"] += 1
+                by[bk]["c"] += int(bool(x.get("is_correct")))
 
     accuracy = (correct / len(valid)) if valid else 0.0
     summary: Dict[str, Any] = {

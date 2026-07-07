@@ -5,6 +5,16 @@ Key difference from the previous version:
   - Uses multiple different video files if available (to vary tensor shapes)
   - Reports first failure index to pinpoint when the engine starts breaking
 
+Tests the INTERLEAVED audio-in-video path (use_audio_in_video=True — audio
+is extracted from the video's own track and interleaved with video tokens,
+no separate audio file is attached). This is the path confirmed to crash
+pinned vllm==0.11.0's V1 engine on every sample with:
+    RuntimeError: Worker failed with error 'index 1 is out of bounds for
+    dimension 0 with size 1'
+(see WorldSense migration notes / vllm_runner.py module docstring: "V1
+engine does not support interleaved modalities yet"). Re-run this after a
+vllm/transformers upgrade to check whether the limitation has been lifted.
+
 Usage:
     # repeat same video N times (baseline — should always pass)
     N=20  MODEL=/path/to/model  python tests/test_qwen_omni_vllm.py
@@ -23,10 +33,36 @@ import traceback
 # Must be set before any vLLM import
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 os.environ.setdefault("VLLM_DISABLE_PROGRESS_BAR", "1")
+# Ensure spawn-mode vLLM worker subprocesses (a fresh interpreter each,
+# re-importing transformers from scratch) also pick up sitecustomize.py's
+# patch — they inherit env vars (incl. PYTHONPATH) but NOT in-memory
+# monkeypatches from this process.
+_repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+os.environ["PYTHONPATH"] = _repo_root + os.pathsep + os.environ.get("PYTHONPATH", "")
+
+# transformers/vllm version-compat shim (see Unify-OmniBench/sitecustomize.py
+# for the full explanation) — this script is often run standalone (bypassing
+# eval.sh's PYTHONPATH export that would auto-load sitecustomize.py), so the
+# same patch is duplicated here to avoid re-hitting:
+#   AttributeError: Qwen2Tokenizer has no attribute all_special_tokens_extended
+try:
+    from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+    if not hasattr(PreTrainedTokenizerBase, "all_special_tokens_extended"):
+        PreTrainedTokenizerBase.all_special_tokens_extended = property(
+            lambda self: self.all_special_tokens
+        )
+except Exception:
+    pass
 
 
 def build_vllm_input(processor, process_mm_info, video_path, audio_path, prompt):
-    """Build vLLM input — identical to vllm_runner._build_one."""
+    """Build vLLM input — identical to vllm_runner._build_one's interleaved
+    branch (use_audio_in_video=True, used by OmniVideoBench/WorldSense):
+    only a video content block is attached (NO separate audio block) — the
+    video's own audio track is what gets extracted and interleaved with
+    video tokens. ``audio_path`` is accepted but unused, kept for call-site
+    symmetry with the sample tuples (vid, video_path, audio_path).
+    """
     conv = [
         {"role": "system", "content": [
             {"type": "text",
@@ -36,12 +72,11 @@ def build_vllm_input(processor, process_mm_info, video_path, audio_path, prompt)
         ]},
         {"role": "user", "content": [
             {"type": "video", "video": video_path},
-            *([{"type": "audio", "audio": audio_path}] if os.path.isfile(audio_path) else []),
             {"type": "text", "text": prompt},
         ]},
     ]
     text = processor.apply_chat_template(conv, add_generation_prompt=True, tokenize=False)
-    audios, images, videos = process_mm_info(conv, use_audio_in_video=False)
+    audios, images, videos = process_mm_info(conv, use_audio_in_video=True)
     video_shape = tuple(videos[0].shape) if videos else None
     audio_shape = tuple(audios[0].shape) if audios else None
     mm_data = {}
@@ -52,14 +87,14 @@ def build_vllm_input(processor, process_mm_info, video_path, audio_path, prompt)
     if images:
         mm_data["image"] = images
     return {"prompt": text, "multi_modal_data": mm_data,
-            "mm_processor_kwargs": {"use_audio_in_video": False},
+            "mm_processor_kwargs": {"use_audio_in_video": True},
             "_debug": {"video_shape": video_shape, "audio_shape": audio_shape}}
 
 
 def main() -> int:
     ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     MODEL_PATH = os.environ.get("MODEL", "/apdcephfs_hldy/share_304318596/weiyangguo/models/Qwen2.5-Omni-7B")
-    N = int(os.environ.get("N", "100"))
+    N = int(os.environ.get("N", "5"))
     VIDEO_DIR = os.environ.get(
         "VIDEO_DIR",
         "/apdcephfs/private_weiyangguo/Agent-Tool/Datasets/Daily-Omni/Videos"
@@ -105,7 +140,8 @@ def main() -> int:
         samples = [(f"draw_{i}", vp, ap) for i in range(N)]
         print(f"[*] Using example/draw.mp4 repeated {N} times (same tensor shape each time)")
 
-    print(f"[*] Will run {N} iterations\n")
+    print(f"[*] Will run {N} iterations")
+    print("[*] use_audio_in_video=True (INTERLEAVED: audio extracted from video's own track, no separate audio file)\n")
 
     # load engine
     print(f"[*] Loading vLLM from: {MODEL_PATH}")
@@ -124,6 +160,15 @@ def main() -> int:
         dtype="bfloat16",
         seed=1234,
         limit_mm_per_prompt={"image": 1, "video": 1, "audio": 1},
+        # [2026-07-02 CONFIRMED ROOT CAUSE, see vllm_runner.py for the full
+        # writeup] Without this, repeating the SAME video content (as this
+        # script deliberately does, to simulate real eval reuse) hits vLLM's
+        # multi-modal processor cache on the 2nd+ occurrence, which returns a
+        # `None` placeholder that pinned vllm==0.11.0's use_audio_in_video
+        # auto-detection doesn't guard against -> "TypeError: 'NoneType'
+        # object is not subscriptable". Disabling it here mirrors the
+        # already-applied fix in config/models/vllm.yaml.
+        mm_processor_cache_gb=0,
     )
     processor = Qwen2_5OmniProcessor.from_pretrained(MODEL_PATH)
     sp = SamplingParams(temperature=0.0, top_p=1.0, top_k=-1, max_tokens=10)
