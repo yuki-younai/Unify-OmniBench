@@ -5,11 +5,17 @@ name: vllm
 model: Qwen/Qwen2.5-Omni-7B
 tensor_parallel_size: 1
 gpu_memory_utilization: 0.95
-max_num_seqs: 1
+max_num_seqs: 4
+# vLLM 引擎内部真实并发调度上限。run.py 会用 --workers/WORKERS 覆盖这个值
+# （跟 concurrency.batch_size 保持一致，不用手动同步）；这里的 4 只是不经过
+# run.py 直接 import VLLMModel 时的兜底默认值。
 dtype: bfloat16
 max_model_len: 32768
 seed: 1234
-concurrency_mode: sequential
+concurrency_mode: batch
+# 真实多prompt一次性提交给 vLLM（generate_batch()），配合上面的 max_num_seqs
+# 做 continuous batching；某条样本触发 EngineDeadError 时该批会整体回退到
+# 逐条重试（runner.py::_run_batched()），不会丢结果。
 enforce_eager: true          # 无害，对齐 vllm_stage_textonly.yaml；未解决下面的确诊问题
 enable_prefix_caching: false # 无害，对齐 vllm_stage_textonly.yaml；未解决下面的确诊问题
 # [2026-07-02 已确诊根因] 完整堆栈（把 runner.py 的 traceback.format_exc(limit=3)

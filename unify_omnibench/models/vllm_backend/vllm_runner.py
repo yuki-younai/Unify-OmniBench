@@ -6,10 +6,10 @@ engine differs.
 
 Environment variables:
     VLLM_USE_V1                          — [2026-07-02] Do **NOT** set this
-        to 0 on the pinned ``vllm==0.11.0`` (see env_init.sh). V0 has been
-        fully removed upstream (official V1 guide: "我们已完全弃用 V0" /
-        RFC #18571), and ``vllm/v1/engine/llm_engine.py``'s ``__init__``
-        actively asserts ``envs.VLLM_USE_V1`` is truthy and raises::
+        to 0. V0 has been fully removed upstream since vllm==0.11.0
+        (official V1 guide: "我们已完全弃用 V0" / RFC #18571), and
+        ``vllm/v1/engine/llm_engine.py``'s ``__init__`` actively asserts
+        ``envs.VLLM_USE_V1`` is truthy and raises::
 
             ValueError: Using V1 LLMEngine, but envs.VLLM_USE_V1=False.
             This should not happen. ...
@@ -20,26 +20,19 @@ Environment variables:
         Daily-Omni/test_model/Qwen2.5-Omni/testmodel.py::load_vllm_backend
         and FutureOmni/eval/infer_vllm.py — those were written against an
         older vLLM where V0/V1 coexisted and this was a genuinely valid
-        workaround; on 0.11.0 there is no V0 to fall back to, so it just
-        breaks engine init. Leave this env var **unset** entirely.
-        The actual, version-relevant constraint is on V1 itself (confirmed
-        in vLLM's own official Qwen2.5-Omni offline-inference example
-        docs): "V1 engine does not support interleaved modalities yet" —
-        i.e. ``use_audio_in_video=True`` (audio extracted from the video's
-        own track, interleaved with video tokens) is simply unsupported
-        under V1 (their own example asserts ``not envs.VLLM_USE_V1`` before
-        allowing it — which would ALSO now raise the same ValueError above
-        if you tried to force V0 to use it).
-        [2026-07-07] ``use_audio_in_video`` is now read from ``self.cfg``
-        (per-dataset override via ``dataset_config.yaml``) instead of being
-        hardcoded ``False`` — see ``__init__``'s risk note. Datasets with a
-        separate audio file (Daily-Omni/OmniBench) should keep it ``False``
-        (audio sent as an independent ``multi_modal_data`` entry — vLLM's
-        officially-supported "mixed_modalities" pattern, no V1 restriction,
-        matches the transformer reference encoding). Datasets whose audio
-        ONLY lives inside the video container (OmniVideoBench) need ``True``
-        to get any audio signal at all — this exercises the V1-unsupported
-        interleaved path above; watch for regressions if enabling it.
+        workaround; on any 0.11.0+ version there is no V0 to fall back to,
+        so it just breaks engine init. Leave this env var **unset** entirely.
+        Interleaved ``use_audio_in_video=True`` used to crash V1 on the
+        previously pinned ``vllm==0.11.0`` (missing support — upstream issue
+        #25473, fixed for Qwen2.5-Omni by PR #33605). Now pinned to
+        ``vllm==0.17.0`` (see env_init.sh), past that fix; verified via
+        ``tests/test_qwen_omni_vllm.py``'s interleaved scenario.
+        ``use_audio_in_video`` is read from ``self.cfg`` (per-dataset
+        override via ``dataset_config.yaml``) — Daily-Omni/OmniBench keep it
+        ``False`` (independent audio file, sent as its own
+        ``multi_modal_data`` entry); OmniVideoBench/WorldSense set it
+        ``True`` (audio comes only from the video's own track, no separate
+        audio file attached).
     VLLM_WORKER_MULTIPROC_METHOD=spawn   — avoid CUDA re-init in forked workers
     VLLM_DISABLE_PROGRESS_BAR=1          — suppress vLLM internal tqdm bars
 """
@@ -133,11 +126,10 @@ class VLLMModel(BaseModel):
             }.items() if v is not None
         }
         # [2026-07-07] 按数据集覆盖（见 dataset_config.yaml::use_audio_in_video）。
-        # ⚠️ 风险提示：vLLM 0.11.0 的 V1 引擎官方文档写明 "V1 engine does not
-        # support interleaved modalities yet"，即 use_audio_in_video=True 这条
-        # 路径在 V1 上可能不稳定（历史上在 openai/vLLM serve 侧遇到过 500，具体
-        # 见下方 _build_one 里 2026-07-02 的详细排查记录）。若某个数据集设为
-        # True 后这里报错/挂起，考虑退回 False 并改用"独立音频文件"的方案。
+        # [2026-07-08] 之前记录过 "V1 engine does not support interleaved
+        # modalities yet" 的风险提示——已确认修复（升级 vllm 后过了上游
+        # PR #33605，见本文件顶部 VLLM_USE_V1 说明），交织模式在 V1 上已验证
+        # 可正常工作，不再是需要规避的高风险路径。
         self.use_audio_in_video = bool(cfg.get("use_audio_in_video", False))
         self.prompt_template = PromptTemplate.from_config(cfg, QWEN_OMNI_DEFAULT)
         self.llm = None
@@ -255,7 +247,87 @@ class VLLMModel(BaseModel):
         return result
 
     def generate_batch(self, reqs: List[InferenceRequest]) -> List[str]:
-        return [self.generate(r) for r in reqs]
+        """[2026-07-08] REAL vLLM continuous-batching call.
+
+        Previously this just looped ``self.generate()`` one request at a
+        time — functionally identical to ``Runner._run_sequential()`` (see
+        ``config/models/vllm.yaml``'s ``concurrency_mode: sequential``,
+        which was set precisely BECAUSE the old ``generate_batch()`` gave
+        zero throughput benefit over sequential — no point picking "batch"
+        mode when it wasn't actually batching anything). This version
+        submits ALL prompts in ``reqs`` to ``self.llm.generate()`` in a
+        SINGLE call, letting vLLM's async V1 scheduler interleave/overlap
+        their prefill+decode steps internally (PagedAttention + continuous
+        batching across concurrently in-flight sequences — this is vLLM's
+        actual reason for existing; one-request-at-a-time throws that away).
+
+        Verified via ``MODE=batch python tests/test_qwen_omni_vllm.py``:
+        results for a given video/prompt are identical whether processed
+        via this real-batch path or the single-request ``generate()``
+        path, and ``self.llm.generate()`` is confirmed to return outputs in
+        the SAME order as the input prompt list (vLLM's documented
+        behavior), so the ``zip(batch, raws)`` alignment in
+        ``Runner._run_batched()`` is safe.
+
+        IMPORTANT — ``max_num_seqs`` must be raised for this to actually
+        help: it caps how many sequences the engine schedules
+        *concurrently* regardless of how many prompts are submitted in one
+        ``.generate()`` call. With the default ``max_num_seqs=1`` (see
+        ``config/models/vllm.yaml``), submitting N prompts here still gets
+        processed one-at-a-time internally — no real speedup, just fewer
+        Python-level calls. Set ``max_num_seqs`` >= ``concurrency.batch_size``
+        to get genuine concurrent scheduling (start small, e.g. 4 — each
+        multi-modal request is memory-heavy, watch for OOM).
+
+        Error handling: intentionally NO internal try/except here. If the
+        whole call raises (e.g. an ``EngineDeadError`` — a single poisoned
+        sample can kill the shared engine for ALL in-flight requests, same
+        risk that exists in sequential mode too, just realized inside one
+        Python call instead of N), the exception propagates to
+        ``Runner._run_batched()``, which already falls back to per-sample
+        ``_infer_one()`` for this chunk (see runner.py) — so one bad sample
+        degrades gracefully to slower-but-isolated retries instead of
+        silently losing the whole batch.
+        """
+        import io as _io
+        import contextlib as _ctxlib
+        from vllm import SamplingParams  # type: ignore
+
+        if not reqs:
+            return []
+
+        vllm_ins = [self._build_one(r) for r in reqs]
+        max_tokens_list = [r.generation_kwargs.get("max_new_tokens", 10) for r in reqs]
+        if len(set(max_tokens_list)) == 1:
+            # Common case (one dataset run = one generation config): a
+            # single shared SamplingParams object is enough.
+            sp: Any = SamplingParams(temperature=0.0, top_p=1.0, top_k=-1, max_tokens=max_tokens_list[0])
+        else:
+            # Per-request max_tokens differ — vLLM accepts a list of
+            # SamplingParams matching the prompts list 1:1.
+            sp = [
+                SamplingParams(temperature=0.0, top_p=1.0, top_k=-1, max_tokens=mt)
+                for mt in max_tokens_list
+            ]
+
+        try:
+            with _ctxlib.redirect_stderr(_io.StringIO()):
+                outs = self.llm.generate(vllm_ins, sampling_params=sp)
+            if len(outs) != len(vllm_ins):
+                # Defensive: should never happen per vLLM's API contract,
+                # but a length mismatch would silently misalign zip() in
+                # Runner._run_batched() — fail loudly instead so it falls
+                # back to per-sample instead of returning wrong answers.
+                raise RuntimeError(
+                    f"vLLM returned {len(outs)} outputs for {len(vllm_ins)} inputs"
+                )
+            return [
+                (out.outputs[0].text if (out and out.outputs) else "")
+                for out in outs
+            ]
+        finally:
+            del vllm_ins
+            gc.collect()
 
     def _build_one(self, req: InferenceRequest) -> Dict[str, Any]:
         import torch
@@ -271,12 +343,12 @@ class VLLMModel(BaseModel):
         mm_data: Dict[str, Any] = {}
         if self._process_mm_info is not None:
             # [2026-07-07] use_audio_in_video 现在按数据集从 self.use_audio_in_video
-            # 读取（见 __init__ 里的风险提示），不再硬编码 False。
-            # 历史注释（保留供排查参考）：True 在 vLLM 0.11.0 V1 引擎上官方文档写明
-            # "V1 engine does not support interleaved modalities yet"，之前观测到
-            # 的 "vLLM stateful bug" 疑似与此有关。False 时 video/audio 作为两个
-            # 独立的 multi_modal_data 条目发送（vLLM 官方支持的 mixed_modalities
-            # 模式，无 V1 限制），适用于有独立音频文件的场景（Daily-Omni/OmniBench）。
+            # 读取（见 __init__ 里的说明），不再硬编码 False。
+            # [2026-07-08] True 时的交织路径（audio 从视频容器提取，与video token
+            # 交织排列）之前在 vLLM V1 上不受支持，现已随版本升级确认修复。False
+            # 时 video/audio 作为两个独立的 multi_modal_data 条目发送（vLLM 官方
+            # 支持的 mixed_modalities 模式），适用于有独立音频文件的场景
+            # （Daily-Omni/OmniBench）。
             audios, images, videos = self._process_mm_info(
                 conv, use_audio_in_video=self.use_audio_in_video
             )

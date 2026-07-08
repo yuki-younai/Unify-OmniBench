@@ -113,6 +113,14 @@ def main(argv=None) -> None:
             model_cfg["max_frames"] = int(video_override["max_frames"])
     if args.vllm_gpu_mem is not None and args.backend == "vllm":
         model_cfg["gpu_memory_utilization"] = args.vllm_gpu_mem
+    if args.backend == "vllm":
+        # [2026-07-08] max_num_seqs（vLLM 引擎内部真实并发调度上限）直接跟
+        # --workers/WORKERS 走同一个值，不再在 vllm.yaml 里单独维护一份容易
+        # 失配的数字——concurrency.batch_size（下面）也是这个值，两者天生一致，
+        # 不用记得手动同步。⚠️ 意味着 WORKERS 调多大，vLLM 就会真的同时并发跑
+        # 多少条多模态请求（不再有 vllm.yaml 里旧的、更保守的默认值兜底），
+        # 显存吃紧时请直接调小 WORKERS。
+        model_cfg["max_num_seqs"] = args.workers
     if args.api_url:
         model_cfg["base_url"] = args.api_url
     if args.api_key:

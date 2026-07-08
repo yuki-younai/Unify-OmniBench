@@ -30,7 +30,8 @@ Usage:
 Output:
     {out_dir}/data/worldsense.json
     {out_dir}/media/video/worldsense/{video}.mp4
-    {out_dir}/media/audio/worldsense/{video}.wav
+    (audios/{video}.wav 不复制——只用交织模式，音频直接从 .mp4 容器提取；
+    见 dataset_config.yaml::worldsense.use_audio_in_video)
 """
 import argparse
 import ast
@@ -68,26 +69,12 @@ def main():
 
     data_dir = os.path.join(args.out_dir, "data")
     video_out = os.path.join(args.out_dir, "media", "video", "worldsense")
-    audio_out = os.path.join(args.out_dir, "media", "audio", "worldsense")
     os.makedirs(data_dir, exist_ok=True)
     os.makedirs(video_out, exist_ok=True)
-    os.makedirs(audio_out, exist_ok=True)
-    # [2026-07-07 REVERTED] Previously this script dropped the independent
-    # audios/{v}.wav and relied solely on use_audio_in_video=True to extract
-    # audio from the .mp4 container (interleaved mode), reasoning it was a
-    # redundant duplicate of the same content. CONFIRMED BROKEN IN PRACTICE:
-    # running worldsense with use_audio_in_video=True on pinned vllm==0.11.0
-    # crashes the V1 engine's GPU worker on every single sample with
-    #   RuntimeError: Worker failed with error 'index 1 is out of bounds
-    #   for dimension 0 with size 1'
-    # — this is exactly the interleaved-modality limitation already flagged
-    # (but never tested) in vllm_runner.py's module docstring: "V1 engine
-    # does not support interleaved modalities yet". Reverted to copying the
-    # independent .wav + use_audio_in_video=False (see dataset_config.yaml),
-    # matching the officially-supported "mixed_modalities" pattern already
-    # working for Daily-Omni/OmniBench.
+    # 只用交织模式（use_audio_in_video=True），不复制独立 audios/{v}.wav——
+    # 音频推理时直接从 .mp4 容器提取，避免同一段音频被喂两遍。
 
-    media_status = {}  # video_name -> (video_rel_or_None, audio_rel_or_None)
+    media_status = {}  # video_name -> video_rel_or_None
     records = []
 
     total = len(df)
@@ -97,23 +84,16 @@ def main():
 
         video_name = str(row["video"])
         if video_name not in media_status:
-            # video_path / audio_path columns are "./videos/{v}.mp4" / "./audios/{v}.wav"
+            # video_path column is "./videos/{v}.mp4"
             src_video = os.path.join(args.data_dir, str(row["video_path"]).lstrip("./"))
-            src_audio = os.path.join(args.data_dir, str(row["audio_path"]).lstrip("./"))
             v_rel = None
-            a_rel = None
             if os.path.exists(src_video):
                 dst_video = os.path.join(video_out, f"{video_name}.mp4")
                 if not os.path.exists(dst_video):
                     shutil.copy2(src_video, dst_video)
                 v_rel = f"media/video/worldsense/{video_name}.mp4"
-            if os.path.exists(src_audio):
-                dst_audio = os.path.join(audio_out, f"{video_name}.wav")
-                if not os.path.exists(dst_audio):
-                    shutil.copy2(src_audio, dst_audio)
-                a_rel = f"media/audio/worldsense/{video_name}.wav"
-            media_status[video_name] = (v_rel, a_rel)
-        video_rel, audio_rel = media_status[video_name]
+            media_status[video_name] = v_rel
+        video_rel = media_status[video_name]
 
         choices = _safe_eval_list(row.get("candidates"))
         audio_class = _safe_eval_list(row.get("audio_class"))
@@ -124,14 +104,9 @@ def main():
             "choices": choices,
             "answer": row.get("answer"),
             "video_path": video_rel,
-            # [2026-07-07 REVERTED to independent audio, see the long note
-            # above main()'s media-copy loop] use_audio_in_video=True
-            # (interleaved) is confirmed broken on pinned vllm==0.11.0's V1
-            # engine — crashes every sample with "index 1 is out of bounds
-            # for dimension 0 with size 1". Back to attaching the
-            # independent .wav + use_audio_in_video=False in
-            # dataset_config.yaml.
-            "audio_path": audio_rel,
+            # 只用交织模式：不挂独立 audio，音频从视频容器里提取（见
+            # dataset_config.yaml::worldsense.use_audio_in_video=true）。
+            "audio_path": None,
             "image_path": None,
             "task_type": row.get("task_type"),
             "category": row.get("domain"),
@@ -150,11 +125,10 @@ def main():
     out_json = os.path.join(data_dir, "worldsense.json")
     json.dump(records, open(out_json, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
 
-    n_video = sum(1 for v, a in media_status.values() if v)
-    n_audio = sum(1 for v, a in media_status.values() if a)
+    n_video = sum(1 for v in media_status.values() if v)
     n_total_videos = len(media_status)
     print(f"Done: {out_json} ({len(records)} QA records, {n_total_videos} unique videos)")
-    print(f"  video: {n_video}/{n_total_videos} copied, audio: {n_audio}/{n_total_videos} copied")
+    print(f"  video: {n_video}/{n_total_videos} copied; audio not copied (interleaved-only)")
 
 
 if __name__ == "__main__":

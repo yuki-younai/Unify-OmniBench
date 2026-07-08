@@ -38,18 +38,13 @@ datasets:
   worldsense:
     data_file: data/worldsense.json
     modality: av
-    # [2026-07-07] 实测确认 use_audio_in_video=True（交织模式）在 pinned
-    # vllm==0.11.0 的 V1 引擎上每条样本必现崩溃：
-    #   RuntimeError: Worker failed with error 'index 1 is out of bounds
-    #   for dimension 0 with size 1'
-    # 即 vllm_runner.py 早前标注过的 "V1 engine does not support interleaved
-    # modalities yet" 限制。改回 False + 独立 audio(.wav)（跟 Daily-Omni/
-    # OmniBench 一样、官方支持的 mixed_modalities 模式），需配合
-    # convert_worldsense.py 重新生成 worldsense.json（audio_path 不再是 None）。
-    use_audio_in_video: false
+    # 只用交织模式：音频从视频容器自带音轨提取，不额外挂独立audio文件
+    # （跟 VLMEvalKit 参考实现相比更简单——参考实现会同时挂交织+独立音频，
+    # 等于把同一段音频喂两遍，这里选择只喂一遍）。
+    use_audio_in_video: true
     video:
-      fps: 2.0
-      max_frames: 256
+      fps: 2.0  # 对齐 VLMEvalKit（Qwen2VLChat 模型默认 fps=2）
+      max_frames: 256  # 长视频（>8min）防显存溢出的安全网
       min_frames: 4
       min_pixels: 100352
       max_pixels: 602112
