@@ -90,7 +90,7 @@ from unify_omnibench.runner import Runner
 
 cfg = {
     "run_dir": "runs/my_run", "modality_mode": "av",
-    "dataset": {"name": "daily_omni", "qa_file": "...", "video_base_dir": "..."},
+    "dataset": {"name": "daily_omni", "data_file": "data/daily_omni.json", "media_root": "/path/to/root"},
     "model":   {"name": "openai_chat", "model": "gpt-4o", "api_key": "sk-..."},
     "concurrency": {"mode": "thread", "max_workers": 8},
     "generation":  {"temperature": 0.0, "max_new_tokens": 16},
@@ -103,11 +103,11 @@ print(summary["accuracy"])
 
 ## 扩展新 Benchmark
 
-1. 创建 `config/datasets/my_bench.yaml` 配置数据路径
-2. 编写适配器继承 `BaseDatasetAdapter`，逐条产出 `Sample`
-3. 运行 `BACKEND=vllm DATASET=my_bench bash eval.sh`
+1. 写一个 `script/convert_xxx.py`，把原始数据转换成统一 JSON（`id/question/choices/answer/video_path/audio_path/image_path/task_type/category/duration/meta`，见 `script/convert_daily_omni.py` 参考）
+2. 在 `unify_omnibench/config/dataset_config.yaml` 的 `datasets:` 下加一个 entry（`data_file` + 可选 `use_audio_in_video`/`video`/`prompt_template` 覆盖）
+3. 运行 `BACKEND=vllm DATASETS=(my_bench) bash eval.sh`
 
-详见 `docs/ADAPTERS.md`。
+所有转换后的数据集共用同一个 `unify_omnibench/datasets/unified.py::UnifiedAdapter`，无需为新 benchmark 写 Python 适配器代码。
 
 ---
 
@@ -116,3 +116,12 @@ print(summary["accuracy"])
 ```bash
 pytest tests/ -v
 ```
+
+---
+
+## 文档
+
+- `docs/Unify-OmniBench-v0.1.0-dev.md` — v0.1.0 开发过程中踩过的坑（vLLM 多模态缓存/
+  交织音频兼容性/显存OOM/并发配置死锁等），升级依赖前建议先看一眼
+- `docs/ADAPTERS.md` — 新增 Model 后端指南（新增数据集见上面「扩展新 Benchmark」）
+- `docs/HF_DATASET_PUBLISHING_GUIDE.md` — 数据集发布到 HuggingFace Hub 的经验总结（Dataset Viewer / Parquet 规范）

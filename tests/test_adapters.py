@@ -1,4 +1,7 @@
-"""Quick adapter sanity tests using on-the-fly fixtures."""
+"""Adapter sanity tests for UnifiedAdapter — the only dataset adapter
+actually registered (see unify_omnibench/datasets/unified.py; it backs
+omnibench/daily_omni/omnivideobench/worldsense, all now sharing the same
+converted-JSON schema produced by script/convert_*.py)."""
 import json
 import os
 import tempfile
@@ -7,45 +10,60 @@ from unify_omnibench.core.registry import build_dataset
 import unify_omnibench.datasets  # noqa: F401
 
 
-def test_daily_omni_adapter():
+def _write_media(path: str) -> str:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(b"\x00")
+    return path
+
+
+def test_unified_adapter_video_audio():
     with tempfile.TemporaryDirectory() as tmp:
-        qa = [{
-            "video_id": "vidX",
-            "Question": "Q?",
-            "Choice": ["A. a", "B. b", "C. c", "D. d"],
-            "Answer": "C",
-            "Type": "audio",
-            "video_category": "music",
-            "video_duration": "<30s",
+        vp = _write_media(os.path.join(tmp, "media", "video", "v1.mp4"))
+        ap = _write_media(os.path.join(tmp, "media", "audio", "v1.wav"))
+        records = [{
+            "id": "daily_omni:0",
+            "question": "What sound is heard?",
+            "choices": ["A. cat", "B. dog", "C. bird", "D. car"],
+            "answer": "A",
+            "video_path": "media/video/v1.mp4",
+            "audio_path": "media/audio/v1.wav",
+            "task_type": "audio",
+            "category": "indoor",
+            "duration": "<30s",
         }]
-        p = os.path.join(tmp, "qa.json")
-        with open(p, "w") as f:
-            json.dump(qa, f)
-        ds = build_dataset({"name": "daily_omni", "qa_file": p, "video_base_dir": tmp, "require_audio": False})
+        data_file = os.path.join(tmp, "data.json")
+        with open(data_file, "w") as f:
+            json.dump(records, f)
+
+        ds = build_dataset({"name": "daily_omni", "data_file": data_file, "media_root": tmp})
         assert len(ds) == 1
         s = next(iter(ds))
         assert s.dataset == "daily_omni"
-        assert s.answer == "C"
-        assert s.meta["video_id"] == "vidX"
-        assert any(m.kind == "video" for m in s.media)
+        assert s.answer == "A"
+        assert s.meta["task_type"] == "audio"
+        kinds = sorted(m.kind for m in s.media)
+        assert kinds == ["audio", "video"]
 
 
-def test_omnibench_adapter():
+def test_unified_adapter_image_audio():
     with tempfile.TemporaryDirectory() as tmp:
-        rec = {
-            "index": 7,
+        ip = _write_media(os.path.join(tmp, "media", "image", "1.jpg"))
+        ap = _write_media(os.path.join(tmp, "media", "audio", "1.wav"))
+        records = [{
+            "id": "omnibench:7",
             "question": "What is heard?",
-            "options": ["A. cat", "B. dog", "C. bird", "D. car"],
+            "choices": ["A. cat", "B. dog", "C. bird", "D. car"],
             "answer": "B",
-            "image_path": "img/1.jpg",
-            "audio_path": "aud/1.wav",
-            "task type": "av_match",
-            "audio type": "speech",
-        }
-        p = os.path.join(tmp, "data.jsonl")
-        with open(p, "w") as f:
-            f.write(json.dumps(rec) + "\n")
-        ds = build_dataset({"name": "omnibench", "data_file": p, "mm_root": tmp})
+            "image_path": "media/image/1.jpg",
+            "audio_path": "media/audio/1.wav",
+            "task_type": "av_match",
+        }]
+        data_file = os.path.join(tmp, "data.json")
+        with open(data_file, "w") as f:
+            json.dump(records, f)
+
+        ds = build_dataset({"name": "omnibench", "data_file": data_file, "media_root": tmp})
         s = next(iter(ds))
         assert s.answer == "B"
         kinds = sorted(m.kind for m in s.media)
@@ -53,22 +71,28 @@ def test_omnibench_adapter():
         assert s.meta["task_type"] == "av_match"
 
 
-def test_omnivideobench_adapter():
+def test_unified_adapter_video_only_and_missing_media():
     with tempfile.TemporaryDirectory() as tmp:
-        data = [{
-            "video": "v1",
-            "video_type": "lecture",
-            "duration": "02:30",
-            "questions": [
-                {"question": "Q1?", "options": ["A","B","C","D"], "correct_option": "A", "question_type": "t1"},
-                {"question": "Q2?", "options": ["A","B","C","D"], "correct_option": "C", "question_type": "t2"},
-            ],
-        }]
-        p = os.path.join(tmp, "d.json")
-        with open(p, "w") as f:
-            json.dump(data, f)
-        ds = build_dataset({"name": "omnivideobench", "data_file": p, "video_dir": tmp})
+        vp = _write_media(os.path.join(tmp, "media", "video", "v2.mp4"))
+        records = [
+            {
+                "id": "omnivideobench:0",
+                "question": "Q1?", "choices": ["A", "B", "C", "D"], "answer": "A",
+                "video_path": "media/video/v2.mp4", "task_type": "t1",
+            },
+            {
+                "id": "omnivideobench:1",
+                "question": "Q2?", "choices": ["A", "B", "C", "D"], "answer": "C",
+                "video_path": "media/video/missing.mp4",  # 不存在 -> media 应为空
+                "task_type": "t2",
+            },
+        ]
+        data_file = os.path.join(tmp, "data.json")
+        with open(data_file, "w") as f:
+            json.dump(records, f)
+
+        ds = build_dataset({"name": "omnivideobench", "data_file": data_file, "media_root": tmp})
         assert len(ds) == 2
-        s = next(iter(ds))
-        assert s.meta["duration_s"] == 150
-        assert s.media[0].kind == "video"
+        samples = list(ds)
+        assert samples[0].media[0].kind == "video"
+        assert samples[1].media == []  # 文件不存在时 UnifiedAdapter 会跳过

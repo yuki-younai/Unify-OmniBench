@@ -16,27 +16,9 @@ concurrency_mode: batch
 # 真实多prompt一次性提交给 vLLM（generate_batch()），配合上面的 max_num_seqs
 # 做 continuous batching；某条样本触发 EngineDeadError 时该批会整体回退到
 # 逐条重试（runner.py::_run_batched()），不会丢结果。
-enforce_eager: true          # 无害，对齐 vllm_stage_textonly.yaml；未解决下面的确诊问题
-enable_prefix_caching: false # 无害，对齐 vllm_stage_textonly.yaml；未解决下面的确诊问题
-# [2026-07-02 已确诊根因] 完整堆栈（把 runner.py 的 traceback.format_exc(limit=3)
-# 去掉截断后拿到）显示真正报错点根本不在 llm.py::_validate_and_add_requests
-# （那只是最外层入口），而是在：
-#   vllm/model_executor/models/qwen2_5_omni_thinker.py
-#   ::_maybe_apply_prompt_updates:
-#     use_audio_in_video = (all(
-#         item["use_audio_in_video"].data for item in mm_kwargs["video"]
-#     ))
-#   TypeError: 'NoneType' object is not subscriptable
-# 即 mm_kwargs["video"] 列表里出现了 None 元素。对比本仓库自己维护的 vllm-omni
-# 里同名函数的实现（vllm-omni/vllm_omni/model_executor/models/qwen2_5_omni/
-# qwen2_5_omni_thinker.py），它显式做了保护：
-#   video_items = [item for item in mm_kwargs["video"] if item is not None]
-# 而 pip 装的 vllm==0.11.0 原生实现没有这个判空。根因：vLLM 的多模态【处理器】
-# 缓存 mm_processor_cache_gb（默认 4GB，默认开启！按内容哈希缓存已处理过的
-# 多模态特征，跟上面 KV-cache 的 enable_prefix_caching 是完全独立的两套缓存）
-# ——同一段视频内容哈希第二次被不同题目请求时，缓存命中会返回 None 占位表示
-# "复用缓存"，而 0.11.0 的 use_audio_in_video 自动检测漏了这个判空。跟实测现象
-# （同一视频第一次成功、后续题目里同一视频间歇性失败）完全吻合。
-# 修复：直接关掉这套缓存（这里每条样本单独调一次 generate()，且同一视频本来就
-# 会被多个不同题目复用，关掉缓存不会有明显性能损失，换来的是不再崩）。
+enforce_eager: true          # 对齐 vllm_stage_textonly.yaml，无副作用
+enable_prefix_caching: false # 对齐 vllm_stage_textonly.yaml，无副作用
+# 规避 vLLM 多模态处理器缓存（默认开启，4GB）对重复出现的同一视频返回 None
+# 占位符、而 use_audio_in_video 自动检测未判空导致的 TypeError（上游未修复，
+# 见 docs/Unify-OmniBench-v0.1.0-dev.md）。
 mm_processor_cache_gb: 0

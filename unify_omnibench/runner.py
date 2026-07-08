@@ -159,46 +159,49 @@ class Runner:
             generation_kwargs=self.cfg.get("generation", {}) or {},
         )
 
+    @staticmethod
+    def _build_result(sample: Sample, raw: str, latency_s: float,
+                       error: Optional[str] = None,
+                       extra_meta: Optional[Dict[str, Any]] = None) -> InferenceResult:
+        """Shared result construction for both sequential/threaded and
+        batched inference paths, so answer-parsing / correctness logic
+        only lives in one place."""
+        parsed = None if error else extract_choice_letter(
+            raw, index2ans=choices_to_index2ans(sample.choices)
+        )
+        meta = dict(sample.meta or {})
+        if extra_meta:
+            meta.update(extra_meta)
+        return InferenceResult(
+            uid=sample.uid,
+            dataset=sample.dataset,
+            question=sample.question,
+            choices=list(sample.choices),
+            raw_output=raw,
+            parsed_answer=parsed,
+            correct_answer=sample.answer,
+            is_correct=(parsed is not None and sample.answer is not None
+                        and parsed.upper() == str(sample.answer).strip().upper()),
+            latency_s=latency_s,
+            error=error,
+            meta=meta,
+        )
+
     def _infer_one(self, sample: Sample) -> InferenceResult:
         req = self._build_req(sample)
         t0 = time.time()
         try:
             raw = self.model.generate(req)
-            parsed = extract_choice_letter(raw, index2ans=choices_to_index2ans(sample.choices))
-            return InferenceResult(
-                uid=sample.uid,
-                dataset=sample.dataset,
-                question=sample.question,
-                choices=list(sample.choices),
-                raw_output=raw,
-                parsed_answer=parsed,
-                correct_answer=sample.answer,
-                is_correct=(parsed is not None and sample.answer is not None
-                            and parsed.upper() == str(sample.answer).strip().upper()),
-                latency_s=time.time() - t0,
-                meta=dict(sample.meta or {}),
-            )
+            return self._build_result(sample, raw, time.time() - t0)
         except Exception as e:
             log.warning("Sample %s failed: %s", sample.uid, e)
-            return InferenceResult(
-                uid=sample.uid,
-                dataset=sample.dataset,
-                question=sample.question,
-                choices=list(sample.choices),
-                raw_output="",
-                parsed_answer=None,
-                correct_answer=sample.answer,
-                is_correct=False,
-                latency_s=time.time() - t0,
+            # Full traceback (not just the outer frame, which for e.g. vLLM
+            # is often just the generic entrypoint) kept in meta to help
+            # diagnose intermittent multimodal-inference failures.
+            return self._build_result(
+                sample, "", time.time() - t0,
                 error=f"{type(e).__name__}: {e}",
-                # [2026-07-02] Was limit=3 — too shallow to see where inside
-                # vLLM's multimodal input processing a NoneType subscript
-                # error actually originates (the outer frame is always
-                # llm.py::_validate_and_add_requests / _add_request, which
-                # itself doesn't raise TypeError — the real culprit is a
-                # deeper, currently-invisible frame). Full trace needed to
-                # pinpoint root cause; can be reverted once diagnosed.
-                meta={**dict(sample.meta or {}), "_traceback": traceback.format_exc()},
+                extra_meta={"_traceback": traceback.format_exc()},
             )
 
     def _persist(self, res: InferenceResult) -> None:
@@ -231,6 +234,7 @@ class Runner:
             for i in range(0, len(pending), B):
                 batch = pending[i:i + B]
                 reqs = [self._build_req(s) for s in batch]
+                t0 = time.time()
                 try:
                     raws = self.model.generate_batch(reqs)
                 except Exception as e:
@@ -240,21 +244,11 @@ class Runner:
                         self._persist(res)
                         pm.update(is_failed=bool(res.error), is_correct=bool(res.is_correct))
                     continue
+                # split the batch's wall-clock time evenly across samples —
+                # not exact per-sample timing, but far better than the
+                # previous hardcoded 0.0
+                latency = (time.time() - t0) / max(len(batch), 1)
                 for s, raw in zip(batch, raws):
-                    parsed = extract_choice_letter(
-                        raw, index2ans=choices_to_index2ans(s.choices)
-                    )
-                    res = InferenceResult(
-                        uid=s.uid,
-                        dataset=s.dataset,
-                        question=s.question,
-                        choices=list(s.choices),
-                        raw_output=raw or "",
-                        parsed_answer=parsed,
-                        correct_answer=s.answer,
-                        is_correct=(parsed is not None and s.answer is not None
-                                    and parsed.upper() == str(s.answer).strip().upper()),
-                        meta=dict(s.meta or {}),
-                    )
+                    res = self._build_result(s, raw or "", latency)
                     self._persist(res)
                     pm.update(is_failed=bool(res.error), is_correct=bool(res.is_correct))

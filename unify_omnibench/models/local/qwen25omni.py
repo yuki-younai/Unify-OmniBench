@@ -102,31 +102,25 @@ class Qwen25OmniModel(BaseModel):
         self.device_map = cfg.get("device", "auto")
         self.attn_impl = cfg.get("attn_implementation", "flash_attention_2")
         self.torch_dtype_str = cfg.get("torch_dtype", "bfloat16")
-        # video 抽帧参数：优先读 dataset_config.yaml 合并进来的 ``video`` 字典
-        # ({"fps", "max_frames", "min_frames"})，在 build_messages() 里注入到
-        # video content block，让 qwen_omni_utils 在解码源头就按这个预算采样，
-        # 而不是解码完默认的 768 帧再事后裁剪（见 dataset_config.yaml 注释）。
+        # video 抽帧预算（fps/max_frames/min_frames + 像素预算三元组），来自
+        # dataset_config.yaml，注入进 video content block 让 qwen_omni_utils
+        # 在解码源头就按预算采样（而非解码默认767帧再事后裁剪）。
         video_cfg = dict(cfg.get("video") or {})
         self.video_kwargs: Dict[str, Any] = {
             k: v for k, v in {
                 "fps": video_cfg.get("fps"),
                 "max_frames": video_cfg.get("max_frames"),
                 "min_frames": video_cfg.get("min_frames"),
-                # 像素预算三元组 —— WorldSense (VLMEvalKit::Qwen2VLChat) 需要，
-                # qwen_omni_utils.vision_process.smart_resize 直接读取这些
-                # per-element 键来决定每帧 resize 到的目标像素数。
                 "min_pixels": video_cfg.get("min_pixels"),
                 "max_pixels": video_cfg.get("max_pixels"),
                 "total_pixels": video_cfg.get("total_pixels"),
             }.items() if v is not None
         }
-        # 仍保留事后裁剪作为安全网（例如装的 qwen_omni_utils 版本忽略了
-        # per-element max_frames 字段时，至少不会把超量帧喂给 processor）
+        # 事后裁剪安全网：万一装的 qwen_omni_utils 版本忽略了源头的 max_frames。
         self.max_frames = int(video_cfg.get("max_frames") or cfg.get("max_frames", 256))
-        # 每数据集可通过 dataset_config.yaml::use_audio_in_video 覆盖（run.py 合并进
-        # model_cfg）。True = 从视频容器自带音轨按时间戳提取音频（OmniVideoBench 需要，
-        # 因为它没有独立音频文件）；False = 音频完全依赖 Sample.media 里的独立 MediaRef
-        # （Daily-Omni / OmniBench 的场景，process_mm_info 不会触碰视频的音轨）。
+        # True = 音频从视频自带音轨按时间戳提取（OmniVideoBench/WorldSense，无
+        # 独立音频文件）；False = 音频来自 Sample.media 里的独立 MediaRef
+        # （Daily-Omni/OmniBench）。按数据集通过 dataset_config.yaml 覆盖。
         self.use_audio_in_video = bool(cfg.get("use_audio_in_video", False))
         self.prompt_template = PromptTemplate.from_config(cfg, QWEN_OMNI_DEFAULT)
         self.model = None
@@ -136,15 +130,9 @@ class Qwen25OmniModel(BaseModel):
     def load(self) -> None:
         import logging as _logging
         import warnings as _warnings
-        # qwen_omni_utils.vision_process 用 logger.warning() 打印
-        # "The given max_pixels[...] exceeds limit[...]"，这是 per-element 动态
-        # 像素预算计算的正常提示（total_pixels 摊薄后的上限低于我们配置的
-        # max_pixels 时必然触发），logging 模块没有内置去重，几乎每个视频样本
-        # 都会打一遍 —— 压掉，不影响正确性，只是噪音。
+        # 压掉 qwen_omni_utils 的像素预算提示和 librosa 重复的 FutureWarning
+        # （均为噪音，不影响正确性）。
         _logging.getLogger("qwen_omni_utils").setLevel(_logging.ERROR)
-        # librosa 的 __audioread_load FutureWarning 本应只打一次（Python
-        # warnings 模块默认按 (message, lineno) 去重），但期间其它库反复调用
-        # warnings.filterwarnings() 会让去重缓存失效，导致重复出现 —— 显式过滤掉。
         _warnings.filterwarnings("ignore", category=FutureWarning, module="librosa.*")
 
         import torch  # noqa: F401
@@ -166,12 +154,7 @@ class Qwen25OmniModel(BaseModel):
             attn_implementation=self.attn_impl,
             enable_audio_output=False,   # 评测不需要 TTS，只加载 Thinker
         )
-        # 显式指定 use_fast=True：HF 的 Qwen2VLImageProcessor 新版本默认已经改成
-        # fast processor，且官方明确警告 fast/slow 两种实现的输出会有细微差异
-        # ("This is a breaking change and may produce slightly different outputs")。
-        # vLLM 服务端(openai backend 打的那个服务)日志确认它用的是 fast 处理器；
-        # 这里显式对齐成同一种，避免两条路径各自依赖所在环境 transformers 版本的
-        # 隐式默认值，从而产生看不见的图像预处理差异。
+        # 显式对齐 fast processor，避免和 vLLM 在线服务的隐式默认值不一致。
         try:
             self.processor = Qwen2_5OmniProcessor.from_pretrained(self.model_path, use_fast=True)
         except TypeError:
@@ -192,11 +175,10 @@ class Qwen25OmniModel(BaseModel):
         return self.prompt_template
 
     def _cap_video_frames(self, videos, max_frames: int):
-        """Uniformly downsample each video's frames so none exceeds *max_frames*.
-
-        Mirrors the inline ``MAX_FRAMES=256`` uniform downsampling in
-        OmniVideoBench's official ``eval/qwenomni_eval.py::process_multimedia_input``.
-        """
+        """Uniformly downsample each video's frames so none exceeds
+        *max_frames* — safety net in case the decode-time budget didn't
+        take effect (e.g. an older qwen_omni_utils ignoring per-element
+        max_frames)."""
         import numpy as np
         if videos is None or max_frames <= 0:
             return videos
@@ -209,6 +191,28 @@ class Qwen25OmniModel(BaseModel):
             indices = [int(i * step) for i in range(max_frames)]
             capped.append(v[indices])
         return capped
+
+    def _move_inputs(self, inputs, torch):
+        """float tensors → device+dtype; int tensors → device only."""
+        for key, value in list(inputs.items()):
+            if isinstance(value, torch.Tensor):
+                if value.is_floating_point():
+                    inputs[key] = value.to(device=self.model.device, dtype=self.model.dtype)
+                else:
+                    inputs[key] = value.to(device=self.model.device)
+        return inputs
+
+    def _run_generate(self, inputs, torch, max_tokens: int):
+        with torch.no_grad():
+            return self.model.generate(
+                **inputs,
+                use_audio_in_video=self.use_audio_in_video,
+                return_audio=False,
+                max_new_tokens=max_tokens,
+                num_beams=1,
+                do_sample=False,
+                eos_token_id=self.processor.tokenizer.eos_token_id,
+            )
 
     def generate(self, req: InferenceRequest) -> str:
         import torch
@@ -226,10 +230,6 @@ class Qwen25OmniModel(BaseModel):
             audios, images, videos = self._process_mm_info(
                 conv, use_audio_in_video=self.use_audio_in_video
             )
-            # 安全网：即便解码源头的 max_frames 生效，这里再做一次事后裁剪也无害
-            # （len(v) <= max_frames 时是 no-op）；如果源头没生效（例如装的
-            # qwen_omni_utils 版本忽略了 per-element 字段），这里仍能兜底防止
-            # 喂给 processor 的帧数超预算。
             videos = self._cap_video_frames(videos, self.max_frames)
         else:
             audios, images, videos = None, None, None
@@ -238,25 +238,10 @@ class Qwen25OmniModel(BaseModel):
             text=text, audio=audios, images=images, videos=videos,
             return_tensors="pt", padding=True, use_audio_in_video=self.use_audio_in_video,
         )
-        # float tensors → device + dtype; int tensors → device only
-        for key, value in list(inputs.items()):
-            if isinstance(value, torch.Tensor):
-                if value.is_floating_point():
-                    inputs[key] = value.to(device=self.model.device, dtype=self.model.dtype)
-                else:
-                    inputs[key] = value.to(device=self.model.device)
+        inputs = self._move_inputs(inputs, torch)
 
         max_tokens = req.generation_kwargs.get("max_new_tokens", 10)
-        with torch.no_grad():
-            out = self.model.generate(
-                **inputs,
-                use_audio_in_video=self.use_audio_in_video,
-                return_audio=False,
-                max_new_tokens=max_tokens,
-                num_beams=1,
-                do_sample=False,
-                eos_token_id=self.processor.tokenizer.eos_token_id,
-            )
+        out = self._run_generate(inputs, torch, max_tokens)
         in_len = inputs["input_ids"].shape[1]
         gen_ids = out[0][:, in_len:] if isinstance(out, tuple) else out[:, in_len:]
         decoded = self.processor.batch_decode(
@@ -283,7 +268,6 @@ class Qwen25OmniModel(BaseModel):
             )
             if self._process_mm_info is not None:
                 a, im, v = self._process_mm_info(conv, use_audio_in_video=self.use_audio_in_video)
-                # 事后裁剪安全网（见 generate() 里同一处的说明）
                 v = self._cap_video_frames(v, self.max_frames)
             else:
                 a, im, v = None, None, None
@@ -299,24 +283,10 @@ class Qwen25OmniModel(BaseModel):
             text=texts, audio=audios, images=images, videos=videos,
             return_tensors="pt", padding=True, use_audio_in_video=self.use_audio_in_video,
         )
-        for key, value in list(inputs.items()):
-            if isinstance(value, torch.Tensor):
-                if value.is_floating_point():
-                    inputs[key] = value.to(device=self.model.device, dtype=self.model.dtype)
-                else:
-                    inputs[key] = value.to(device=self.model.device)
+        inputs = self._move_inputs(inputs, torch)
 
         max_tokens = reqs[0].generation_kwargs.get("max_new_tokens", 10) if reqs else 10
-        with torch.no_grad():
-            out = self.model.generate(
-                **inputs,
-                use_audio_in_video=self.use_audio_in_video,
-                return_audio=False,
-                max_new_tokens=max_tokens,
-                num_beams=1,
-                do_sample=False,
-                eos_token_id=self.processor.tokenizer.eos_token_id,
-            )
+        out = self._run_generate(inputs, torch, max_tokens)
 
         gen_ids = out[0] if isinstance(out, tuple) else out
         in_len = inputs["input_ids"].shape[1]

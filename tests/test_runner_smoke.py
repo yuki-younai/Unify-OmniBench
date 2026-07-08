@@ -1,4 +1,4 @@
-"""End-to-end smoke test using the EchoModel and a temp Daily-Omni-like dataset."""
+"""End-to-end smoke test using the EchoModel and a temp UnifiedAdapter dataset."""
 import json
 import os
 import tempfile
@@ -11,46 +11,39 @@ import unify_omnibench.datasets  # noqa: F401
 import unify_omnibench.models  # noqa: F401
 
 
-def _make_fake_daily_omni(tmp):
-    qa = [
+def _make_fake_dataset(tmp) -> str:
+    """Unified-JSON fixture (the schema produced by script/convert_*.py) —
+    text-only records so no actual media files are needed."""
+    records = [
         {
-            "video_id": "vid001",
-            "Question": "What sound is heard?",
-            "Choice": ["A. cat", "B. dog", "C. bird", "D. car"],
-            "Answer": "A",
-            "Type": "audio",
-            "video_category": "indoor",
-            "video_duration": "<30s",
+            "id": "daily_omni:0",
+            "question": "What sound is heard?",
+            "choices": ["A. cat", "B. dog", "C. bird", "D. car"],
+            "answer": "A",
+            "task_type": "audio",
         },
         {
-            "video_id": "vid002",
-            "Question": "Color of the shirt?",
-            "Choice": ["A. red", "B. blue", "C. green", "D. yellow"],
-            "Answer": "B",
-            "Type": "visual",
-            "video_category": "outdoor",
-            "video_duration": "<60s",
+            "id": "daily_omni:1",
+            "question": "Color of the shirt?",
+            "choices": ["A. red", "B. blue", "C. green", "D. yellow"],
+            "answer": "B",
+            "task_type": "visual",
         },
     ]
-    qa_path = os.path.join(tmp, "qa.json")
-    with open(qa_path, "w") as f:
-        json.dump(qa, f)
-    return qa_path
+    data_file = os.path.join(tmp, "data.json")
+    with open(data_file, "w") as f:
+        json.dump(records, f)
+    return data_file
 
 
 def test_runner_end_to_end_echo():
     with tempfile.TemporaryDirectory() as tmp:
-        qa_path = _make_fake_daily_omni(tmp)
+        data_file = _make_fake_dataset(tmp)
         run_dir = os.path.join(tmp, "run")
         cfg = {
             "run_dir": run_dir,
             "modality_mode": "text",
-            "dataset": {
-                "name": "daily_omni",
-                "qa_file": qa_path,
-                "video_base_dir": tmp,
-                "require_audio": False,
-            },
+            "dataset": {"name": "daily_omni", "data_file": data_file, "media_root": tmp},
             "model": {"name": "echo", "fixed_answer": "A"},
             "generation": {},
             "concurrency": {"mode": "thread", "max_workers": 2},
@@ -71,15 +64,12 @@ def test_runner_end_to_end_echo():
 
 def test_runner_resume_skips_done():
     with tempfile.TemporaryDirectory() as tmp:
-        qa_path = _make_fake_daily_omni(tmp)
+        data_file = _make_fake_dataset(tmp)
         run_dir = os.path.join(tmp, "run")
         cfg = {
             "run_dir": run_dir,
             "modality_mode": "text",
-            "dataset": {
-                "name": "daily_omni", "qa_file": qa_path,
-                "video_base_dir": tmp, "require_audio": False,
-            },
+            "dataset": {"name": "daily_omni", "data_file": data_file, "media_root": tmp},
             "model": {"name": "echo", "fixed_answer": "A"},
             "generation": {},
             "concurrency": {"mode": "sequential"},

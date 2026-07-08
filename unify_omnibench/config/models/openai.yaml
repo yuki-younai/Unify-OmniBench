@@ -7,27 +7,17 @@ model: Qwen2.5-Omni-7B
 base_url: http://localhost:8001/v1
 system_prompt: "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, capable of perceiving auditory and visual inputs, as well as generating text and speech."
 video:
-  mode: qwen_native       # 客户端抽帧 + OmniVideoBench 官方 pixel-budget 缩放，
-                          # 像素级对齐 transformer 后端（同一条 fetch_video 路径，
-                          # VIDEO_MIN_PIXELS / VIDEO_MAX_PIXELS / VIDEO_TOTAL_PIXELS
-                          # / smart_resize 都与 OmniVideoBench/utils/vision_process.py
-                          # 一致）。这是当前唯一能对齐官方 baseline 的视频模式；
-                          # video_mp4 把 raw mp4 丢给 vLLM 解码，vLLM 不做 per-frame
-                          # pixel budget 缩放（且 media_io_kwargs 逐请求覆盖被忽略），
-                          # 高分辨率视频生成的 token 量远大于 transformer 路径，
-                          # 会导致 max_model_len 溢出且帧像素精度也不同于官方 config。
-  num_frames: 120         # video_mp4 / file_url 模式用（vllm_deploy.sh 需一致）
-  max_frames: 64          # qwen_native 模式用；120 帧 + pixel budget 缩放后实测仍
-                          # 超 32768 tokens（43200 > 32768），降为 64 帧确保不溢出，
-                          # 且 pixel budget 仍在 resize 时生效（帧数少→每帧分辨率更高，
-                          # 总量约 23040 tokens，远低于上限）
-  min_frames: 4           # qwen_native 模式用；对齐 OmniVideoBench FPS_MIN_FRAMES=4
-  fps: 2                  # fetch_video 的 target fps（OmniVideoBench 默认 FPS=2.0）；
-                          # 同时写入 extra_body.mm_processor_kwargs.fps 用于
-                          # second_per_grid_ts 时序编码
+  mode: qwen_native       # 客户端抽帧 + 官方 pixel-budget 缩放，像素级对齐 transformer 后端
+                          # （video_mp4 让 vLLM 自己解码，不做逐帧 pixel budget 缩放，token量
+                          # 更大、精度也不同，无法对齐官方 baseline）
+  num_frames: 120         # video_mp4 / file_url 模式用
+  max_frames: 64          # qwen_native 模式用；120帧+pixel budget缩放后已验证会超 32768 tokens，
+                          # 64帧确保不溢出（帧数少→每帧分辨率更高，pixel budget仍生效）
+  min_frames: 4
+  fps: 2                  # 同时写入 extra_body.mm_processor_kwargs.fps 用于时序编码
 audio:
   mode: audio_url         # 独立发送 16kHz wav，对齐 transformer 后端
-use_audio_in_video: false # 对齐 transformer 参照后端（硬编码 False）
+use_audio_in_video: false # 对齐 transformer 参照后端
 retry:
   max_retries: 3
   base_delay: 2.0

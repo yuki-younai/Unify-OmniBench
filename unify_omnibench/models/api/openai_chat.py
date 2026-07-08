@@ -97,19 +97,14 @@ class _BaseOpenAIChatModel(BaseModel):
     ) -> List[Dict[str, Any]]:
         """Convert filtered media refs to OpenAI content blocks.
 
-        NOTE on the ``num_frames``/``fps`` keys set on ``video_url`` below:
-        vLLM's ``VideoURL`` TypedDict (vllm/entrypoints/chat_utils.py) only
-        declares a ``url`` field, and its content-part parser does
-        ``.get("video_url", {}).get("url", None)`` — i.e. it discards any
-        extra keys we put here. These fields are effectively **inert** on
-        the current vLLM version; kept only in case a future vLLM version
-        adds first-class support for them (harmless no-op otherwise). The
-        actual, currently-working levers are:
-          * frame count/rate for LOADING  -> server's ``--media-io-kwargs``
-            startup default, NOT per-request.
-          * ``fps`` for TEMPORAL ENCODING (``second_per_grid_ts``) -> the
-            ``mm_processor_kwargs.fps`` set explicitly in ``generate()``
-            below, the only channel Qwen2_5OmniProcessor actually reads.
+        NOTE: the ``num_frames``/``fps`` keys set on ``video_url`` below are
+        currently inert on vLLM's server (its ``VideoURL`` TypedDict only
+        declares ``url``, extra keys are discarded) — kept in case a future
+        vLLM version adds first-class support. The levers that actually
+        work today: frame count/rate at LOAD time via the server's
+        ``--media-io-kwargs`` startup default (not per-request), and
+        temporal encoding via ``mm_processor_kwargs.fps`` set explicitly in
+        ``generate()`` below.
         """
         out: List[Dict[str, Any]] = []
         has_video = any(mm.kind == "video" for mm in media)
@@ -321,16 +316,8 @@ class OpenAIChatModel(_BaseOpenAIChatModel):
 class OpenAIOmniChatModel(_BaseOpenAIChatModel):
     """OpenAI-compatible chat for vllm-omni ``--omni`` multi-stage servers.
 
-    vllm-omni's serving layer (``vllm_omni/entrypoints/openai/serving_chat.py``)
-    ignores standard temperature/max_tokens/top_p fields entirely for
-    pipelined (Omni) models.  It only reads ``extra_body.sampling_params_list``,
-    falling back to each stage's YAML ``default_sampling_params`` (which
-    defaults to ``repetition_penalty=1.1``, ``max_tokens=2048`` in
-    ``vllm_stage_textonly.yaml``).  This backend explicitly sets per-stage
-    sampling params to match the transformer/vllm-offline baselines
-    (repetition_penalty=1.0, temperature=0, etc.), and sends nothing via
-    standard request fields (they would be silently ignored by the server
-    anyway).
+    See module docstring for why sampling params go through
+    ``extra_body.sampling_params_list`` instead of standard fields.
     """
 
     def _init_backend_specific(self, cfg: Dict[str, Any]) -> None:

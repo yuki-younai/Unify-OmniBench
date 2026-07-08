@@ -1,6 +1,11 @@
+> ⚠️ **"1. 新增一个 Benchmark"一节描述的是早期设计（每个数据集单独一个
+> Adapter 类），当前实际实现已统一成单一的 `unified.py::UnifiedAdapter` +
+> `script/convert_*.py` 转换脚本**，新增数据集不需要再写 Python 适配器代码，
+> 见 `README.md`「扩展新 Benchmark」一节。"2. 新增一个 Model"一节仍然适用。
+
 # 扩展指南：新增 Benchmark / 新增 Model
 
-本文档面向**贡献者**，描述如何把新数据集或新模型接入 Unify-OmniBench。前置阅读：`DESIGN.md` 与 `ARCHITECTURE.md`。
+本文档面向**贡献者**，描述如何把新数据集或新模型接入 Unify-OmniBench。
 
 ---
 

@@ -10,11 +10,10 @@ To add a new benchmark, add an entry under ``datasets:`` in
 ``dataset_config.yaml`` — no Python change needed. All ``data_file`` /
 ``media_root`` are resolved relative to the single ``root`` path.
 
-Decoding params (``max_new_tokens`` / ``temperature``) no longer live in a
-YAML file — :func:`get_generation_cfg` returns a hardcoded default dict.
-Override them at the CLI via ``run.py --max-new-tokens`` / ``--temperature``
-/ ``--top-p`` (wired through ``eval.sh``'s ``MAX_NEW_TOKENS`` / ``TEMPERATURE``
-/ ``TOP_P`` variables).
+解码默认参数（``max_new_tokens`` / ``temperature``）硬编码在
+:func:`get_generation_cfg`，通过 ``run.py`` 的 ``--max-new-tokens`` /
+``--temperature`` / ``--top-p`` 覆盖（对应 ``eval.sh`` 的
+``MAX_NEW_TOKENS`` / ``TEMPERATURE`` / ``TOP_P``）。
 """
 from __future__ import annotations
 

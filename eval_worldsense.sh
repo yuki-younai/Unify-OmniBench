@@ -6,19 +6,19 @@
 # Modes: norm (直出答案) | cot (思维链，建议配合更大的 MAX_NEW_TOKENS)
 # 结果目录: results/<dataset>/<model_name>_<backend>_<mode>/
 
-#export CUDA_VISIBLE_DEVICES=4,5,6,7   
-export CUDA_VISIBLE_DEVICES=0,1,2,3
+export CUDA_VISIBLE_DEVICES=4,5,6,7   
+#export CUDA_VISIBLE_DEVICES=0,1,2,3
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export VLLM_DISABLE_PROGRESS_BAR=1
 # 让 vLLM spawn 出来的 worker 子进程也吃到 sitecustomize.py 的兼容性补丁
 export PYTHONPATH="$(cd "$(dirname "$0")" && pwd):${PYTHONPATH:-}"
 
 BACKEND=vllm                                 # openai | openai-omni | vllm | transformer | echo
-DATASETS=(daily_omni  omnibench)                                # 支持多个：DATASETS=(daily_omni omnibench)
+DATASETS=(worldsense)                                # 支持多个：DATASETS=(daily_omni omnibench)
 INFER_MODE=norm                                       # norm | cot
-MODEL_PATH=/apdcephfs_hldy/share_304318596/weiyangguo/models/Qwen2.5-Omni-7B    
-MODEL_NAME=Qwen2.5-Omni-7B                          # results/<DATASET>/<MODEL_NAME>_<BACKEND>_<MODE>/
-WORKERS=8                                             # batch_size；vllm 后端同时也是 max_num_seqs
+MODEL_PATH=/apdcephfs_hldy/share_304318596/weiyangguo/models/Qwen2.5-Omni-3B    
+MODEL_NAME=Qwen2.5-Omni-3B                          # results/<DATASET>/<MODEL_NAME>_<BACKEND>_<MODE>/
+WORKERS=4                                             # batch_size；vllm 后端同时也是 max_num_seqs
                                                       # （引擎真实并发上限），显存紧张就调小
 API_URL=http://localhost:8001/v1                     # API server 地址
 API_KEY=                                              # 空=本地vLLM / 非空=公有云(自动读$OPENAI_API_KEY)

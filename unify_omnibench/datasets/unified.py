@@ -29,7 +29,7 @@ class UnifiedAdapter(BaseDatasetAdapter):
 
     def __init__(self, cfg):
         super().__init__(cfg)
-        self.name = cfg.get("name", self.name)  # 实例属性覆盖类属性（三个装饰器共享同一个 cls.name=omnibench）
+        self.name = cfg.get("name", self.name)  # 实例属性覆盖类属性（多个装饰器共享同一个类，cls.name 取最后一次赋值）
         with open(cfg["data_file"], "r", encoding="utf-8") as f:
             self.records = json.load(f)
         self.media_root = cfg.get("media_root", "")

@@ -65,53 +65,53 @@ def main():
 
     total = len(lines)
     for i, line in enumerate(lines):
-            r = json.loads(line)
-            if (i + 1) % 20 == 0 or i + 1 == total:
-                print(f"[{i + 1}/{total}] missing_img={missing_img} missing_aud={missing_aud}",
-                      flush=True)
+        r = json.loads(line)
+        if (i + 1) % 20 == 0 or i + 1 == total:
+            print(f"[{i + 1}/{total}] missing_img={missing_img} missing_aud={missing_aud}",
+                  flush=True)
 
-            options = parse_options(r.get("options") or r.get("option"))
-            answer = text_to_letter(r.get("answer") or r.get("correct answer", ""), options)
+        options = parse_options(r.get("options") or r.get("option"))
+        answer = text_to_letter(r.get("answer") or r.get("correct answer", ""), options)
 
-            ip = ap = None
+        ip = ap = None
 
-            img = r.get("image_path") or r.get("image")
-            if img:
-                src = os.path.join(args.mm_root, "image", img)
-                dst = os.path.join(image_out, img)
-                if os.path.exists(src):
-                    shutil.copy2(src, dst)
-                    ip = f"media/image/omnibench/{img}"
-                else:
-                    missing_img += 1
+        img = r.get("image_path") or r.get("image")
+        if img:
+            src = os.path.join(args.mm_root, "image", img)
+            dst = os.path.join(image_out, img)
+            if os.path.exists(src):
+                shutil.copy2(src, dst)
+                ip = f"media/image/omnibench/{img}"
+            else:
+                missing_img += 1
 
-            aud = r.get("audio_path") or r.get("audio")
-            if aud:
-                src = os.path.join(args.mm_root, "audio", aud)
-                dst = os.path.join(audio_out, aud)
-                if os.path.exists(src):
-                    shutil.copy2(src, dst)
-                    ap = f"media/audio/omnibench/{aud}"
-                else:
-                    missing_aud += 1
+        aud = r.get("audio_path") or r.get("audio")
+        if aud:
+            src = os.path.join(args.mm_root, "audio", aud)
+            dst = os.path.join(audio_out, aud)
+            if os.path.exists(src):
+                shutil.copy2(src, dst)
+                ap = f"media/audio/omnibench/{aud}"
+            else:
+                missing_aud += 1
 
-            records.append({
-                "id": f"omnibench:{r.get('index', '?')}",
-                "question": r.get("question", ""),
-                "choices": options,
-                "answer": answer,
-                "video_path": None,
-                "audio_path": ap,
-                "image_path": ip,
-                "task_type": r.get("task type"),
-                "category": None,
-                "duration": None,
-                "meta": {
-                    "audio_type": r.get("audio type"),
-                    "audio_content": r.get("audio content"),
-                    "image_content": r.get("image content"),
-                },
-            })
+        records.append({
+            "id": f"omnibench:{r.get('index', '?')}",
+            "question": r.get("question", ""),
+            "choices": options,
+            "answer": answer,
+            "video_path": None,
+            "audio_path": ap,
+            "image_path": ip,
+            "task_type": r.get("task type"),
+            "category": None,
+            "duration": None,
+            "meta": {
+                "audio_type": r.get("audio type"),
+                "audio_content": r.get("audio content"),
+                "image_content": r.get("image content"),
+            },
+        })
 
     out_json = os.path.join(data_dir, "omnibench.json")
     json.dump(records, open(out_json, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
