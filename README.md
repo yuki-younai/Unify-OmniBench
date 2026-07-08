@@ -1,5 +1,8 @@
 # Unify-OmniBench
 
+代码仓库：**[github.com/yuki-younai/Unify-OmniBench](https://github.com/yuki-younai/Unify-OmniBench)**
+配套数据集：[🤗 yukiyounai/Unify-OmniBench](https://huggingface.co/datasets/yukiyounai/Unify-OmniBench)
+
 > 统一评测 **Daily-Omni / OmniBench / OmniVideoBench / WorldSense** 等多模态 Benchmark。
 > 支持本地 `transformers` / `vLLM`，以及 OpenAI 兼容 / Gemini 外部 API。
 > 自动并发/批处理、断点续跑、答案抽取、分桶报告。
@@ -45,6 +48,9 @@ Unify-OmniBench/
 ## 安装
 
 ```bash
+git clone https://github.com/yuki-younai/Unify-OmniBench.git
+cd Unify-OmniBench
+
 pip install -e .              # 基础
 pip install -e ".[api]"       # + openai / google-genai
 pip install -e ".[local]"     # + torch / transformers
@@ -77,8 +83,10 @@ python run.py --backend vllm --dataset daily_omni \
 | `--model-name` | 结果目录名 |
 | `--api-url` | API 地址（API backend） |
 | `--workers` | 并发数（默认 8） |
-| `--resume` | 断点续跑 |
-| `--rerun-failed` | 只重跑失败项 |
+| `--limit` | 只跑前 N 条（配合 `--task-type` 快速抽查） |
+| `--task-type` | 只跑指定 `meta.task_type` 的样本 |
+
+**断点续跑 / 失败重测是自动的、不需要任何参数**：同一个 `results/<dataset>/<model_name>_<backend>_<mode>/` 目录再跑一次，已成功的样本自动跳过，失败/未解析出答案的样本自动重新推理，统计不会因为重复记录而失真。
 
 ---
 

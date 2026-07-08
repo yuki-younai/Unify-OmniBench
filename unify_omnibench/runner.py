@@ -52,13 +52,27 @@ class Runner:
         log.info("Loading model: %s", self.model.name)
         self.model.load()
 
+        # 断点重测：清理上一次（可能被中断的）运行留下的重复/过期记录，同时让
+        # write_summary() 的统计不被同一个 uid 的多条历史记录污染。之后
+        # _load_done_uids() 天然会把所有失败/未解析的样本重新纳入 pending——
+        # 不需要单独的 --rerun-failed 步骤，每次跑都会自动重测之前失败的样本。
+        self._compact_items()
+
         all_samples: List[Sample] = list(self.dataset)
         log.info("Dataset '%s' loaded: %d samples", self.dataset.name, len(all_samples))
 
         done_uids = self._load_done_uids()
+        retry_uids = self._previously_failed_uids()
         if done_uids:
             log.info("Resume: skipping %d already-finished samples", len(done_uids))
         pending = [s for s in all_samples if s.uid not in done_uids]
+        n_retry = sum(1 for s in pending if s.uid in retry_uids)
+        if n_retry:
+            log.info(
+                "Auto-retry: %d/%d pending samples previously failed or "
+                "unparsed — retrying them automatically (no --rerun-failed "
+                "needed)", n_retry, len(pending),
+            )
 
         # optional task_type filter — for quickly re-checking a specific
         # failure category (e.g. "Event Sequence") without evaluating the
@@ -91,6 +105,13 @@ class Runner:
         else:
             raise ValueError(f"Unknown concurrency mode: {mode}")
 
+        # 这一轮新写入的成功记录跟旧的失败记录（同一个 uid）此时同时存在于
+        # items.jsonl 里——run() 开头的那次 compact 只清理了"上一轮遗留"的重复，
+        # 清不掉"这一轮刚产生"的重复，必须在算 summary 前再 compact 一次，
+        # 否则重跑过的样本会被计两遍，total/accuracy 都会算错。
+        if pending:
+            self._compact_items()
+
         summary = write_summary(
             self.items_path,
             out_dir=self.run_dir,
@@ -109,27 +130,43 @@ class Runner:
             log.warning("model.close() raised: %s", e)
         return summary
 
-    def rerun_failed(self) -> Dict[str, Any]:
-        """Re-evaluate samples that errored or failed-to-parse on the previous run.
+    # ---------------------------------------------------------------- internals
+    def _compact_items(self) -> None:
+        """Rewrite ``items.jsonl`` keeping only the LATEST record per uid.
 
-        Implementation: filter out failed records from ``items.jsonl``, then call
-        :meth:`run`. The base dataset adapter will re-emit them; resume logic will
-        skip the already-successful ones.
+        ``_persist()`` only ever appends. Since every :meth:`run` call
+        automatically re-attempts any uid that previously errored or failed
+        to parse (see ``_load_done_uids``), a sample retried across multiple
+        resume cycles would otherwise leave BOTH its stale failed record(s)
+        AND its new record in ``items.jsonl`` — inflating ``total`` and
+        skewing ``accuracy`` in :func:`write_summary`. Compacting (last
+        occurrence wins, since the file is append-ordered) keeps the
+        bookkeeping accurate no matter how many times a sample has been
+        retried, and regenerates ``failed.jsonl`` to match — a uid that
+        succeeded on retry must stop showing up there.
         """
         items = load_jsonl(self.items_path)
-        keep = [
-            x for x in items
-            if not x.get("error") and x.get("parsed_answer")
-        ]
-        dropped = len(items) - len(keep)
-        log.info("rerun-failed: dropping %d failed/unparsed items from items.jsonl", dropped)
-        rewrite_jsonl(self.items_path, keep)
-        # clear failed.jsonl too (it will be regenerated)
-        if os.path.exists(self.failed_path):
+        if not items:
+            return
+        latest: Dict[str, Dict[str, Any]] = {}
+        for rec in items:
+            uid = rec.get("uid")
+            if uid is not None:
+                latest[uid] = rec  # later occurrence overwrites earlier one
+        if len(latest) == len(items):
+            return  # nothing stale to drop
+        deduped = list(latest.values())
+        log.info("Compacted items.jsonl: dropped %d stale duplicate record(s) "
+                  "from earlier retries", len(items) - len(deduped))
+        rewrite_jsonl(self.items_path, deduped)
+        still_failed = [r for r in deduped if r.get("error")]
+        if still_failed:
+            rewrite_jsonl(self.failed_path, still_failed)
+        elif os.path.exists(self.failed_path):
+            # 全部重测成功——不留一个空的 failed.jsonl，直接删掉文件本身
             os.remove(self.failed_path)
-        return self.run()
+            log.info("All previously-failed samples now pass — removed %s", self.failed_path)
 
-    # ---------------------------------------------------------------- internals
     def _resolve_mode(self) -> str:
         mode = self.cfg.get("concurrency", {}).get("mode", "auto")
         if mode != "auto":
@@ -150,6 +187,21 @@ class Runner:
                 continue
             done.add(rec["uid"])
         return done
+
+    def _previously_failed_uids(self) -> Set[str]:
+        """uids that already have a record in ``items.jsonl`` but did NOT
+        finish successfully (errored, or the answer couldn't be parsed) —
+        exactly the ones ``_load_done_uids()`` excludes, so they'll show up
+        in ``pending`` again. Only used for the "auto-retry: N samples" log
+        line below — a way to actually SEE that retry is happening, since
+        those uids are otherwise indistinguishable from never-attempted
+        ones once mixed into ``pending``."""
+        failed: Set[str] = set()
+        for rec in load_jsonl(self.items_path):
+            uid = rec.get("uid")
+            if uid is not None and (rec.get("error") or rec.get("parsed_answer") is None):
+                failed.add(uid)
+        return failed
 
     def _build_req(self, sample: Sample) -> InferenceRequest:
         return InferenceRequest(

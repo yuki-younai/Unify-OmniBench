@@ -20,10 +20,15 @@ datasets:
     data_file: data/omnivideobench.json
     modality: av
     use_audio_in_video: true
+    # 原始实现 FPS_MAX_FRAMES=120 对应 128K 上下文窗口，vLLM 只有 32K
+    # （1/4），按比例缩帧数+像素预算，避免 prompt 超 max_model_len=32768
     video:
       fps: 2.0
-      max_frames: 256
+      max_frames: 48           # 120 * 32K/128K ≈ 30，稍宽裕取 48
       min_frames: 4
+      min_pixels: 100352
+      max_pixels: 602112
+      total_pixels: 36126720   # 90316800 * 32K/128K * 48/120，对应 per-frame 602K 上限
     prompt_template: |
       You are given a video. Based on the content of the video, answer the following question:
 

@@ -12,6 +12,11 @@ Usage:
     python run.py --backend echo   --dataset daily_omni --model-name echo
 
 Results are saved to: ``results/<dataset>/<model_name>/``
+
+断点续跑是自动的、无需任何参数：同一个 run_dir（同样的 dataset/model-name/backend/
+mode 组合）再跑一次，已经成功完成的样本会被跳过，之前失败/未解析出答案的样本会
+自动重新推理——``Runner._compact_items()`` 会在每次开跑前清理掉同一 uid 的历史
+重复记录，保证 summary 统计不被污染。
 """
 from __future__ import annotations
 
@@ -68,12 +73,6 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="override base_url for api backends (e.g. http://localhost:8001/v1)")
     p.add_argument("--api-key", default="",
                    help="API key (empty = local vLLM / non-empty = cloud API)")
-    p.add_argument("--resume", action="store_true",
-                   help="reuse existing results/<dataset>/<model_name>/ dir "
-                        "and skip already-finished uids")
-    p.add_argument("--rerun-failed", action="store_true",
-                   help="re-run only failed / unparsed items in the existing "
-                        "results dir")
     p.add_argument("--limit", type=int, default=None,
                    help="only evaluate the first N (post-filter) pending samples "
                         "— for quick sanity checks without waiting for a full run")
@@ -178,10 +177,7 @@ def main(argv=None) -> None:
     ds = build_dataset(cfg["dataset"])
     md = build_model(cfg["model"])
     runner = Runner(ds, md, cfg)
-    if args.rerun_failed:
-        runner.rerun_failed()
-    else:
-        runner.run()
+    runner.run()
 
 
 if __name__ == "__main__":

@@ -14,11 +14,11 @@ export VLLM_DISABLE_PROGRESS_BAR=1
 export PYTHONPATH="$(cd "$(dirname "$0")" && pwd):${PYTHONPATH:-}"
 
 BACKEND=vllm                                 # openai | openai-omni | vllm | transformer | echo
-DATASETS=(daily_omni  omnibench)                                # 支持多个：DATASETS=(daily_omni omnibench)
+DATASETS=(omnivideobench)                                # 支持多个：DATASETS=(daily_omni omnibench)
 INFER_MODE=norm                                       # norm | cot
 MODEL_PATH=/apdcephfs_hldy/share_304318596/weiyangguo/models/Qwen2.5-Omni-7B    
 MODEL_NAME=Qwen2.5-Omni-7B                          # results/<DATASET>/<MODEL_NAME>_<BACKEND>_<MODE>/
-WORKERS=8                                             # batch_size；vllm 后端同时也是 max_num_seqs
+WORKERS=1                                             # batch_size；vllm 后端同时也是 max_num_seqs
                                                       # （引擎真实并发上限），显存紧张就调小
 API_URL=http://localhost:8001/v1                     # API server 地址
 API_KEY=                                              # 空=本地vLLM / 非空=公有云(自动读$OPENAI_API_KEY)

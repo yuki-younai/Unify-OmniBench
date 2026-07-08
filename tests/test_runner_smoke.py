@@ -86,3 +86,58 @@ def test_runner_resume_skips_done():
             n_lines = sum(1 for _ in f)
         assert n_lines == 2, f"expected 2 lines after resume, got {n_lines}"
         assert s2["total"] == 2
+
+
+def test_runner_auto_retries_failed_and_compacts_items():
+    """A uid that errored on a previous (possibly interrupted) run must be
+    automatically re-attempted on the next plain run() call — no separate
+    --rerun-failed step needed — and its stale failed record must be
+    replaced (not left alongside the new one), so summary stats aren't
+    double-counted."""
+    with tempfile.TemporaryDirectory() as tmp:
+        data_file = _make_fake_dataset(tmp)
+        run_dir = os.path.join(tmp, "run")
+        os.makedirs(run_dir, exist_ok=True)
+
+        # Simulate a previous run where sample 0 errored out.
+        stale_failed = {
+            "uid": "daily_omni:0", "dataset": "daily_omni",
+            "question": "What sound is heard?", "choices": [],
+            "raw_output": "", "parsed_answer": None, "correct_answer": "A",
+            "is_correct": False, "latency_s": 0.1,
+            "error": "RuntimeError: simulated failure", "meta": {},
+        }
+        items_path = os.path.join(run_dir, "items.jsonl")
+        with open(items_path, "w") as f:
+            f.write(json.dumps(stale_failed) + "\n")
+        failed_path = os.path.join(run_dir, "failed.jsonl")
+        with open(failed_path, "w") as f:
+            f.write(json.dumps(stale_failed) + "\n")
+
+        cfg = {
+            "run_dir": run_dir,
+            "modality_mode": "text",
+            "dataset": {"name": "daily_omni", "data_file": data_file, "media_root": tmp},
+            "model": {"name": "echo", "fixed_answer": "A"},
+            "generation": {},
+            "concurrency": {"mode": "sequential"},
+        }
+        ds = build_dataset(cfg["dataset"])
+        md = build_model(cfg["model"])
+        summary = Runner(ds, md, cfg).run()
+
+        # uid "daily_omni:0" must have been retried (echo always succeeds),
+        # and its stale error record must be gone — not duplicated.
+        with open(items_path) as f:
+            recs = [json.loads(l) for l in f if l.strip()]
+        assert len(recs) == 2, f"expected 2 deduped records, got {len(recs)}"
+        rec0 = next(r for r in recs if r["uid"] == "daily_omni:0")
+        assert rec0["error"] is None
+        assert rec0["is_correct"] is True
+
+        # failed.jsonl must be removed entirely — no uid is failing anymore,
+        # so an empty leftover file should not linger.
+        assert not os.path.exists(failed_path), "failed.jsonl should be removed once nothing fails"
+
+        assert summary["total"] == 2, "stale duplicate must not inflate total"
+        assert summary["failed"] == 0

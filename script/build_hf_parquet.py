@@ -213,12 +213,16 @@ configs:
   data_files:
   - split: train
     path: "data/omnivideobench-train-*.parquet"
+- config_name: worldsense
+  data_files:
+  - split: train
+    path: "data/worldsense-train-*.parquet"
 ---
 
 # Unify-OmniBench
 
-统一格式的多模态评测数据集，由 [Unify-OmniBench](https://github.com/xxx) 框架转换生成。
-包含三个 benchmark，在 Dataset Viewer 右上角下拉框切换。
+统一格式的多模态评测数据集，由 [Unify-OmniBench](https://github.com/yuki-younai/Unify-OmniBench) 框架转换生成。
+包含四个 benchmark，在 Dataset Viewer 右上角下拉框切换。
 
 ## 数据概览
 
@@ -227,6 +231,7 @@ configs:
 | `daily_omni` | ~1197 | Video + Audio | .mp4 + .wav |
 | `omnibench` | ~1142 | Image + Audio | .png/.jpg + .mp3 |
 | `omnivideobench` | ~1000 | Video (embedded audio) | .mp4 |
+| `worldsense` | ~3172 | Video (embedded audio) | .mp4 |
 
 ## 使用方式
 
@@ -242,14 +247,15 @@ print(ds[0]["question"], "->", ds[0]["answer"])
 - **OmniBench**: [arXiv 2409.15272](https://arxiv.org/abs/2409.15272)
 - **Daily-Omni**: [arXiv 2505.17862](https://arxiv.org/abs/2505.17862)
 - **OmniVideoBench**: [NJU-LINK/OmniVideoBench](https://github.com/NJU-LINK/OmniVideoBench)
-- **转换工具**: Unify-OmniBench
+- **WorldSense**: via [VLMEvalKit](https://github.com/open-compass/VLMEvalKit)
+- **转换工具**: [Unify-OmniBench](https://github.com/yuki-younai/Unify-OmniBench)
 """
 
 # ── 主流程 ────────────────────────────────────────────────
 def main():
     os.makedirs(WORK_DIR, exist_ok=True)
 
-    # 三个 benchmark 的配置
+    # 四个 benchmark 的配置
     benchmarks = {
         "daily_omni": {
             "media_cols": ["video_path", "audio_path"],
@@ -258,6 +264,11 @@ def main():
             "media_cols": ["image_path", "audio_path"],
         },
         "omnivideobench": {
+            "media_cols": ["video_path"],
+        },
+        "worldsense": {
+            # 只用交织模式（use_audio_in_video=true），convert_worldsense.py
+            # 不挂独立 audio_path（一直是 None），跟 omnivideobench 一样只有 video_path。
             "media_cols": ["video_path"],
         },
     }
@@ -304,32 +315,40 @@ def main():
         print(f"[auth] logged in as: {who.get('name', '?')}")
     except Exception as e:
         sys.exit(f"认证失败: {e}\n"
-                 "  检查: 1) HF_TOKEN 是否正确 2) token 是否过期 3) 是否有 {REPO_ID} 的写权限")
+                 f"  检查: 1) HF_TOKEN 是否正确 2) token 是否过期 3) 是否有 {REPO_ID} 的写权限\n"
+                 f"  4) 如果是 429 Too Many Requests，是撞到了限速配额，等几分钟再重试即可")
 
     # 上传媒体文件夹（默认跳过；设置 WITH_MEDIA=1 才会传）
+    # 注意：HfApi.upload_large_folder() 不支持 path_in_repo 参数——它是按
+    # folder_path 自身的相对路径结构原样映射到仓库路径的，所以 folder_path 必须
+    # 传 LOCAL_ROOT 本身（这样 "media/audio/xxx.wav" 这个相对路径才会保留
+    # "media/" 前缀，跟 hf_uri() 写进 parquet 里的引用路径对上），用
+    # allow_patterns 限定只传 media/ 下的内容，不会把 data/ 也传一遍。
     if os.environ.get("WITH_MEDIA") == "1":
         media_base = os.path.join(LOCAL_ROOT, "media")
-        if os.path.isdir(media_base):
-            for sub in os.listdir(media_base):
-                sub_path = os.path.join(media_base, sub)
-                if not os.path.isdir(sub_path):
-                    continue
-                # 统计递归文件数
-                file_count = sum(
-                    1 for _ in os.listdir(sub_path)
-                    if os.path.isfile(os.path.join(sub_path, _)) and not _.startswith('.')
-                )
-                if file_count == 0:
-                    continue
-                target = f"media/{sub}"
-                print(f"[upload] {target}/ ({file_count} files) ...")
-                api.upload_large_folder(
-                    repo_id=REPO_ID,
-                    repo_type="dataset",
-                    revision=REF,
-                    folder_path=sub_path,
-                    path_in_repo=target,
-                )
+        file_count = sum(
+            1 for _root, _dirs, _files in os.walk(media_base)
+            for f in _files if not f.startswith('.')
+        ) if os.path.isdir(media_base) else 0
+        if file_count == 0:
+            print("[skip] media/ 下没有文件")
+        else:
+            print(f"[upload] media/ ({file_count} files) ...")
+            api.upload_large_folder(
+                repo_id=REPO_ID,
+                repo_type="dataset",
+                revision=REF,
+                folder_path=LOCAL_ROOT,
+                allow_patterns=["media/**"],
+                # 文件数多（上千个小音频/图片/视频）时，默认并发太高会在几分钟内
+                # 撞到 HF 免费账号 "1000 requests / 5min" 的限速（429 Too Many
+                # Requests，见 LFS preupload 报错）。降低并发能明显减少同一时间
+                # 窗口内发出的请求数；可通过 UPLOAD_WORKERS 环境变量调整
+                # （命中 429 时调更小，比如 1；网络好、账号限额高可以调大）。
+                # upload_large_folder 本身是可续传的（内部有本地状态缓存），
+                # 中断/限速后直接重跑同一条命令即可跳过已成功的文件，不会重传。
+                num_workers=int(os.environ.get("UPLOAD_WORKERS", "2")),
+            )
     else:
         print("[skip] media upload (set WITH_MEDIA=1 to upload)")
 
