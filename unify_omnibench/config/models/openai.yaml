@@ -5,7 +5,6 @@
 name: openai_chat
 model: Qwen2.5-Omni-7B
 base_url: http://localhost:8001/v1
-system_prompt: "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, capable of perceiving auditory and visual inputs, as well as generating text and speech."
 video:
   mode: qwen_native       # 客户端抽帧 + 官方 pixel-budget 缩放，像素级对齐 transformer 后端
                           # （video_mp4 让 vLLM 自己解码，不做逐帧 pixel budget 缩放，token量

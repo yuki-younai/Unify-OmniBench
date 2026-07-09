@@ -4,7 +4,7 @@
 配套数据集：[🤗 yukiyounai/Unify-OmniBench](https://huggingface.co/datasets/yukiyounai/Unify-OmniBench)
 
 > 统一评测 **Daily-Omni / OmniBench / OmniVideoBench / WorldSense** 等多模态 Benchmark。
-> 支持本地 `transformers` / `vLLM`，以及 OpenAI 兼容 / Gemini 外部 API。
+> 支持本地 `transformers` / `vLLM`，以及 OpenAI 兼容外部 API。
 > 自动并发/批处理、断点续跑、答案抽取、分桶报告。
 
 ## 支持的 Benchmark
@@ -36,7 +36,7 @@ Unify-OmniBench/
     ├── core/                    # types / registry / config
     ├── prompt/                  # 统一媒体层 + prompt 模板
     ├── datasets/                # daily_omni / omnibench / omnivideobench / worldsense
-    ├── models/                  # echo / openai_chat / openai_omni / gemini / qwen25omni / vllm
+    ├── models/                  # echo / openai_chat / openai_omni / qwen25omni / vllm
     ├── eval/                    # parser + report
     └── utils/
 ```
@@ -77,7 +77,7 @@ python run.py --backend vllm --dataset daily_omni \
 
 | 参数 | 说明 |
 |---|---|
-| `--backend` | `echo` / `openai` / `openai-omni` / `gemini` / `qwen_omni` / `vllm` |
+| `--backend` | `echo` / `openai` / `openai-omni` / `qwen_omni` / `vllm` |
 | `--dataset` | `daily_omni` / `omnibench` / `omnivideobench` / `worldsense` |
 | `--model-path` | 模型路径（本地 backend） |
 | `--model-name` | 结果目录名 |

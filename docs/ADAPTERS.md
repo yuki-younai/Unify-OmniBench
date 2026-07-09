@@ -104,7 +104,6 @@ unify-eval run --config configs/qwen25omni_dailyomni_av.yaml \
 | 跑 1000 条只评出 0% | 90% 是 `parse` 阶段失败 → 查看 `items.jsonl` 中 `raw_output` 与 `parsed_answer`；调 `extract_choice_letter` |
 | 多线程跑 OpenAI 报 rate limit | 调小 `concurrency.max_workers`；模型层的 `retry` 已退避，但极端情形需限速 |
 | 本地模型 OOM | 减小 `max_frames`；或换 `vllm` + `tensor_parallel_size>1` |
-| Gemini files.upload 大文件失败 (500) | 模型层已捕获 500 跳过；该样本会写入 `failed.jsonl`，同一个 `results/` 目录下重新跑一次 `run.py` 会自动重测（不需要额外参数，`Runner.run()` 每次都会自动重跑失败/未解析的样本并清理重复记录） |
 | 重跑后 total 数不对 / 想确认某个样本到底有没有真的成功 | 看 `items.jsonl` 该 uid 对应行的 `error` 字段是否为空（为空才算成功，才会被跳过） |
 
 ---
@@ -119,7 +118,6 @@ unify-eval run --config configs/qwen25omni_dailyomni_av.yaml \
 | `configs/qwen25omni_dailyomni_av.yaml`| 本地 Transformers Qwen2.5-Omni-3B，跑 Daily-Omni AV |
 | `configs/qwen25omni_dailyomni_av_vllm.yaml` | 同上但走 vLLM 批处理 |
 | `configs/gpt4o_omnibench_imgaudio.yaml` | GPT-4o（OpenAI 兼容）跑 OmniBench |
-| `configs/gemini_omnivideobench.yaml`  | Gemini-2.5-Flash 跑 OmniVideoBench，多线程 |
 | `configs/deepseek_text_dailyomni.yaml`| DeepSeek 纯文本（visual/audio 退化）跑 Daily-Omni |
 
 每份 yaml 都遵循 `DESIGN.md §6.2` 的字段集，并通过 `_base_` 继承公共 dataset 块。
@@ -136,7 +134,6 @@ pip install -e .
 # 2) 准备环境变量（API 模型）
 export GPT4O_API_KEY=...
 export GPT4O_BASE_URL=...
-export GEMINI_API_KEY=...
 
 # 3) 跑评测
 unify-eval run --config configs/gpt4o_omnibench_imgaudio.yaml

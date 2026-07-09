@@ -6,7 +6,6 @@
 name: openai_omni
 model: Qwen2.5-Omni-7B
 base_url: http://localhost:8001/v1
-system_prompt: "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, capable of perceiving auditory and visual inputs, as well as generating text and speech."
 video:
   mode: video_mp4
   num_frames: 128

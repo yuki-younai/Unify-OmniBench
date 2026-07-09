@@ -41,6 +41,7 @@ class InferenceRequest:
     sample: Sample
     modality_mode: str = "av"            # "av" | "visual" | "audio" | "text"
     prompt_template: Optional[str] = None
+    system_prompt: Optional[str] = None
     generation_kwargs: Dict[str, Any] = field(default_factory=dict)
 
 

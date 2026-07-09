@@ -35,7 +35,6 @@ _DEFAULT_GENERATION_CFG: Dict[str, Any] = {
 # Env-var name per backend for injecting API keys.
 _API_KEY_ENV: Dict[str, str] = {
     "openai": "OPENAI_API_KEY",
-    "gemini": "GEMINI_API_KEY",
 }
 
 

@@ -24,11 +24,9 @@ from openai import OpenAI
 from ...core.registry import register_model
 from ...core.types import InferenceRequest, MediaRef
 from ...prompt.media import media_description
-from ...prompt.templates import PromptTemplate, OPENAI_DEFAULT
 from ...utils.video_io import (
     encode_audio_data_url_16k,
     encode_file_base64,
-    extract_frames_base64,
     extract_qwen_native_frames_base64,
     probe_video_frame_count,
 )
@@ -64,14 +62,11 @@ class _BaseOpenAIChatModel(BaseModel):
         api_key = cfg.get("api_key") or os.environ.get("OPENAI_API_KEY", "EMPTY")
 
         self._client = OpenAI(api_key=api_key, base_url=base_url)
-        self.prompt_template = PromptTemplate.from_config(cfg, OPENAI_DEFAULT)
 
         vcfg = cfg.get("video", {}) or {}
-        self.seconds_per_frame = float(vcfg.get("seconds_per_frame", 0.5))
         self.max_frames = vcfg.get("max_frames", 768)
         self.min_frames = int(vcfg.get("min_frames", 4))
-        self.video_mode = vcfg.get("mode", "video_mp4")
-        self.video_num_frames = vcfg.get("num_frames")
+        self.video_mode = vcfg.get("mode", "qwen_native")
         self.video_fps = vcfg.get("fps")
 
         acfg = cfg.get("audio", {}) or {}
@@ -95,17 +90,7 @@ class _BaseOpenAIChatModel(BaseModel):
     def _media_to_content(
         self, media: List[MediaRef], modality_mode: str
     ) -> List[Dict[str, Any]]:
-        """Convert filtered media refs to OpenAI content blocks.
-
-        NOTE: the ``num_frames``/``fps`` keys set on ``video_url`` below are
-        currently inert on vLLM's server (its ``VideoURL`` TypedDict only
-        declares ``url``, extra keys are discarded) — kept in case a future
-        vLLM version adds first-class support. The levers that actually
-        work today: frame count/rate at LOAD time via the server's
-        ``--media-io-kwargs`` startup default (not per-request), and
-        temporal encoding via ``mm_processor_kwargs.fps`` set explicitly in
-        ``generate()`` below.
-        """
+        """Convert filtered media refs to OpenAI content blocks."""
         out: List[Dict[str, Any]] = []
         has_video = any(mm.kind == "video" for mm in media)
         for m in media:
@@ -120,55 +105,30 @@ class _BaseOpenAIChatModel(BaseModel):
                 if self.video_mode == "qwen_native":
                     frames, achieved_fps = extract_qwen_native_frames_base64(
                         m.path,
-                        fps=float(self.video_fps or (1.0 / self.seconds_per_frame if self.seconds_per_frame > 0 else 2.0)),
+                        fps=float(self.video_fps or 2.0),
                         min_frames=self.min_frames,
                         max_frames=int(self.max_frames),
                     )
-                    url = f"data:video/jpeg;base64,{','.join(frames)}"
                     out.append({
                         "type": "video_url",
-                        "video_url": {"url": url, "num_frames": len(frames), "fps": achieved_fps},
+                        "video_url": {"url": f"data:video/jpeg;base64,{','.join(frames)}",
+                                      "num_frames": len(frames), "fps": achieved_fps},
                     })
-                elif self.video_mode == "file_url":
-                    video_url: Dict[str, Any] = {"url": f"file://{os.path.abspath(m.path)}"}
-                    if self.video_num_frames is not None:
-                        video_url["num_frames"] = int(self.video_num_frames)
-                    if self.video_fps is not None:
-                        video_url["fps"] = float(self.video_fps)
-                    out.append({"type": "video_url", "video_url": video_url})
-                elif self.video_mode == "video_mp4":
+                else:  # "video_mp4"
                     ext = os.path.splitext(m.path)[1].lower().lstrip(".")
                     mime = f"video/{ext}" if ext else "video/mp4"
                     b64 = encode_file_base64(m.path)
-                    video_url = {"url": f"data:{mime};base64,{b64}"}
-                    if self.video_num_frames is not None:
-                        video_url["num_frames"] = int(self.video_num_frames)
-                    if self.video_fps is not None:
-                        video_url["fps"] = float(self.video_fps)
-                    out.append({"type": "video_url", "video_url": video_url})
-                elif self.video_mode == "video_data_url":
-                    frames = extract_frames_base64(
-                        m.path, seconds_per_frame=self.seconds_per_frame, max_frames=int(self.max_frames))
-                    url = f"data:video/jpeg;base64,{','.join(frames)}"
-                    fps = 1.0 / self.seconds_per_frame if self.seconds_per_frame > 0 else 2.0
                     out.append({
                         "type": "video_url",
-                        "video_url": {"url": url, "num_frames": len(frames), "fps": fps},
+                        "video_url": {"url": f"data:{mime};base64,{b64}"},
                     })
-                else:  # "frames"
-                    for fb in extract_frames_base64(m.path, self.seconds_per_frame, self.max_frames):
-                        out.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{fb}"}})
             elif m.kind == "audio":
                 if self.audio_mode == "skip":
                     continue
-                if self.use_audio_in_video and has_video and self.video_mode in ("video_mp4", "file_url"):
+                if self.use_audio_in_video and has_video and self.video_mode == "video_mp4":
                     continue
                 data_url = encode_audio_data_url_16k(m.path)
-                if self.audio_mode == "audio_url":
-                    out.append({"type": "audio_url", "audio_url": {"url": data_url}})
-                else:
-                    b64 = data_url.split(",", 1)[1]
-                    out.append({"type": "input_audio", "input_audio": {"data": b64, "format": "wav"}})
+                out.append({"type": "audio_url", "audio_url": {"url": data_url}})
         return out
 
     def _media_refs_for_mode(self, sample, modality_mode: str) -> List[MediaRef]:
@@ -187,26 +147,22 @@ class _BaseOpenAIChatModel(BaseModel):
         """Build OpenAI-compatible messages (system + user)."""
         s = req.sample
         desc = media_description(s, req.modality_mode)
-        if req.prompt_template:
-            text_prompt = req.prompt_template.format(
-                media_desc=desc,
-                question=s.question,
-                choices="\n".join(str(c) for c in s.choices),
-            )
-        else:
-            text_prompt = self.prompt_template.render(
-                media_desc=desc, question=s.question, choices=s.choices,
-            )
+        text_prompt = (req.prompt_template or "").format(
+            media_desc=desc,
+            question=s.question,
+            choices="\n".join(str(c) for c in s.choices),
+        )
+        system = req.system_prompt or ""
         if req.modality_mode == "text" or not s.media:
             return [
-                {"role": "system", "content": self.prompt_template.system or ""},
+                {"role": "system", "content": system},
                 {"role": "user", "content": text_prompt},
             ]
         refs = self._media_refs_for_mode(s, req.modality_mode)
         content = self._media_to_content(refs, req.modality_mode)
         content.append({"type": "text", "text": text_prompt})
         return [
-            {"role": "system", "content": self.prompt_template.system or ""},
+            {"role": "system", "content": system},
             {"role": "user", "content": content},
         ]
 
@@ -221,14 +177,14 @@ class _BaseOpenAIChatModel(BaseModel):
 
         has_audio = any(m.kind == "audio" for m in refs)
         mpk = dict(extra_body.get("mm_processor_kwargs") or {})
-        if self.use_audio_in_video and has_audio and self.video_mode in ("video_mp4", "file_url"):
+        if self.use_audio_in_video and has_audio and self.video_mode == "video_mp4":
             mpk["use_audio_in_video"] = True
         if self.video_fps is not None:
             mpk.setdefault("fps", float(self.video_fps))
         if mpk:
             extra_body["mm_processor_kwargs"] = mpk
 
-        if self.video_mode in ("video_mp4", "file_url"):
+        if self.video_mode == "video_mp4":
             video_ref = next((m for m in refs if m.kind == "video"), None)
             if video_ref is not None:
                 try:

@@ -1,5 +1,0 @@
-# Google Gemini backend.
-# api_key is filled from $GEMINI_API_KEY at runtime.
-name: gemini
-model: gemini-2.0-flash
-concurrency_mode: thread

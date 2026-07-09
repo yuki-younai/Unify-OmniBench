@@ -1,27 +1,11 @@
-"""Prompt templates — model-specific with optional benchmark overrides.
+"""Prompt templates.
 
-Usage
------
-Each model backend provides a default template.  Benchmarks can override it
-in their YAML config via ``prompt_template`` / ``system_prompt`` fields:
-
-.. code-block:: yaml
-
-    # config/datasets/my_bench.yaml
-    name: my_bench
-    ...
-    prompt_template: |
-      基于以下{media_desc}回答问题：
-      {question}
-      选项：
-      {choices}
-    system_prompt: "你是一个多模态评测助手。"
-
-New benchmarks that don't override these fields get the model-default template.
+Prompt 现在全部由 dataset_config.yaml 统一定义（system_prompt + prompt_template），
+不再有 model-backend 级默认值。这里只保留 --mode cot 的特殊模板。
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 
@@ -58,30 +42,8 @@ class PromptTemplate:
             d["system"] = self.system
         return d
 
-    @classmethod
-    def from_config(cls, cfg: Dict[str, Any], default: "PromptTemplate") -> "PromptTemplate":
-        """Merge a YAML config's prompt fields with a default template.
 
-        If the config provides ``prompt_template`` and/or ``system_prompt``,
-        they take precedence over *default*.
-        """
-        return cls(
-            user=cfg.get("prompt_template") or default.user,
-            system=cfg.get("system_prompt") or default.system,
-        )
-
-
-# ── Shared user prompt (all backends use the same text) ─────────────────
-
-_USER_PROMPT_NORM = (
-    "Your task is to accurately answer multiple-choice questions "
-    "based on the {media_desc}.\n"
-    "Select the single most accurate answer from the given choices.\n"
-    "Question: {question}\n"
-    "Choices: {choices}\n"
-    "Your answer should be a capital letter representing your choice: "
-    "A, B, C, or D. Don't generate any other text."
-)
+# ── CoT user prompt (only special template kept; --mode cot in run.py) ──
 
 _USER_PROMPT_COT = (
     "Your task is to accurately answer multiple-choice questions "
@@ -91,20 +53,4 @@ _USER_PROMPT_COT = (
     "Then provide your final answer on a new line as: ANSWER: X\n\n"
     "Question: {question}\n"
     "Choices: {choices}"
-)
-
-# ── Per-backend defaults (system prompt only differs) ──────────────────
-
-QWEN_OMNI_DEFAULT = PromptTemplate(
-    system=(
-        "You are Qwen, a virtual human developed by the Qwen Team, "
-        "Alibaba Group, capable of perceiving auditory and visual "
-        "inputs, as well as generating text and speech."
-    ),
-    user=_USER_PROMPT_NORM,
-)
-
-OPENAI_DEFAULT = PromptTemplate(
-    system="You are a multimodal evaluator. Answer with one letter only (A/B/C/D).",
-    user=_USER_PROMPT_NORM,
 )

@@ -5,6 +5,7 @@ import tempfile
 
 from unify_omnibench.core.registry import build_dataset, build_model
 from unify_omnibench.runner import Runner
+from unify_omnibench.utils.io import load_jsonl
 
 # trigger registration
 import unify_omnibench.datasets  # noqa: F401
@@ -141,3 +142,42 @@ def test_runner_auto_retries_failed_and_compacts_items():
 
         assert summary["total"] == 2, "stale duplicate must not inflate total"
         assert summary["failed"] == 0
+
+
+def test_progress_baseline_reflects_prior_progress():
+    """The progress bar shouldn't restart from 0 on a resumed run — it
+    should continue from wherever the dataset-wide progress actually is
+    (e.g. "1/2" not "0/1"), and the accuracy baseline must already include
+    the previously-completed sample."""
+    with tempfile.TemporaryDirectory() as tmp:
+        data_file = _make_fake_dataset(tmp)  # 2 samples total
+        run_dir = os.path.join(tmp, "run")
+        cfg = {
+            "run_dir": run_dir,
+            "modality_mode": "text",
+            "dataset": {"name": "daily_omni", "data_file": data_file, "media_root": tmp},
+            "model": {"name": "echo", "fixed_answer": "A"},
+            "generation": {},
+            "concurrency": {"mode": "sequential"},
+        }
+        ds = build_dataset(cfg["dataset"])
+        md = build_model(cfg["model"])
+        runner = Runner(ds, md, cfg)
+
+        # Simulate an interrupted first run that only got through sample 0
+        # (gold answer "A", echo answers "A" -> correct).
+        from unify_omnibench.core.types import InferenceResult
+        runner._persist(InferenceResult(
+            uid="daily_omni:0", dataset="daily_omni", question="q", choices=[],
+            raw_output="A", parsed_answer="A", correct_answer="A",
+            is_correct=True, latency_s=0.1,
+        ))
+
+        all_samples = list(build_dataset(cfg["dataset"]))
+        done_uids, _, correct_uids = runner._scan_items(load_jsonl(os.path.join(run_dir, "items.jsonl")))
+        assert done_uids == {"daily_omni:0"}
+
+        bar_total, bar_initial, bar_correct = runner._progress_baseline(all_samples, done_uids, correct_uids)
+        assert bar_total == 2, "bar total should be the whole dataset, not just pending"
+        assert bar_initial == 1, "bar should start at the position already completed"
+        assert bar_correct == 1, "accuracy baseline must include the prior correct sample"

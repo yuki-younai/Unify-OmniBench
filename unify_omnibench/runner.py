@@ -52,17 +52,13 @@ class Runner:
         log.info("Loading model: %s", self.model.name)
         self.model.load()
 
-        # 断点重测：清理上一次（可能被中断的）运行留下的重复/过期记录，同时让
-        # write_summary() 的统计不被同一个 uid 的多条历史记录污染。之后
-        # _load_done_uids() 天然会把所有失败/未解析的样本重新纳入 pending——
-        # 不需要单独的 --rerun-failed 步骤，每次跑都会自动重测之前失败的样本。
+        # 清理上一轮遗留的重复/过期记录（失败样本会自动重跑，见 _scan_items）。
         self._compact_items()
 
         all_samples: List[Sample] = list(self.dataset)
         log.info("Dataset '%s' loaded: %d samples", self.dataset.name, len(all_samples))
 
-        done_uids = self._load_done_uids()
-        retry_uids = self._previously_failed_uids()
+        done_uids, retry_uids, correct_uids = self._scan_items(load_jsonl(self.items_path))
         if done_uids:
             log.info("Resume: skipping %d already-finished samples", len(done_uids))
         pending = [s for s in all_samples if s.uid not in done_uids]
@@ -85,6 +81,19 @@ class Runner:
             ]
             log.info("Filtered to task_type=%r: %d pending samples", task_type_filter, len(pending))
 
+        # 多 worker 分片：每个 worker 只负责 hash(uid) % num_shards == shard_id 的样本。
+        # 使用 hash 而非下标切分，保证同一个 uid 无论 resume 多少次都落在同一个
+        # worker 上（断点续跑正确性），且 shard 间负载天然均匀。
+        shard_id = self.cfg.get("shard_id")
+        num_shards = self.cfg.get("num_shards")
+        if shard_id is not None and num_shards is not None:
+            pending = [
+                s for s in pending
+                if abs(hash(s.uid)) % int(num_shards) == int(shard_id)
+            ]
+            log.info("Shard %d/%d: %d pending samples after shard filter",
+                     int(shard_id), int(num_shards), len(pending))
+
         # apply optional sample limit / shuffling for debugging
         limit = self.cfg.get("limit")
         if limit:
@@ -94,14 +103,18 @@ class Runner:
         mode = self._resolve_mode()
         log.info("Concurrency mode = %s", mode)
 
+        # 进度条基线：让重试/断点续跑的进度条接着全量数据集的进度往下走。
+        bar_total, bar_initial, bar_correct = self._progress_baseline(
+            all_samples, done_uids, correct_uids)
+
         if not pending:
             log.info("Nothing to do — all samples already evaluated.")
         elif mode == "thread":
-            self._run_threaded(pending)
+            self._run_threaded(pending, bar_total, bar_initial, bar_correct)
         elif mode == "batch":
-            self._run_batched(pending)
+            self._run_batched(pending, bar_total, bar_initial, bar_correct)
         elif mode == "sequential":
-            self._run_sequential(pending)
+            self._run_sequential(pending, bar_total, bar_initial, bar_correct)
         else:
             raise ValueError(f"Unknown concurrency mode: {mode}")
 
@@ -136,7 +149,7 @@ class Runner:
 
         ``_persist()`` only ever appends. Since every :meth:`run` call
         automatically re-attempts any uid that previously errored or failed
-        to parse (see ``_load_done_uids``), a sample retried across multiple
+        to parse (see ``_scan_items``), a sample retried across multiple
         resume cycles would otherwise leave BOTH its stale failed record(s)
         AND its new record in ``items.jsonl`` — inflating ``total`` and
         skewing ``accuracy`` in :func:`write_summary`. Compacting (last
@@ -177,37 +190,49 @@ class Runner:
             return "thread"
         return "sequential"
 
-    def _load_done_uids(self) -> Set[str]:
-        done: Set[str] = set()
-        for rec in load_jsonl(self.items_path):
-            # a sample is "done" only if it completed without error AND parsed something
-            if rec.get("error"):
-                continue
-            if rec.get("parsed_answer") is None:
-                continue
-            done.add(rec["uid"])
-        return done
+    @staticmethod
+    def _scan_items(items: List[Dict[str, Any]]) -> tuple[Set[str], Set[str], Set[str]]:
+        """One pass over items.jsonl -> (done_uids, retry_uids, correct_uids).
 
-    def _previously_failed_uids(self) -> Set[str]:
-        """uids that already have a record in ``items.jsonl`` but did NOT
-        finish successfully (errored, or the answer couldn't be parsed) —
-        exactly the ones ``_load_done_uids()`` excludes, so they'll show up
-        in ``pending`` again. Only used for the "auto-retry: N samples" log
-        line below — a way to actually SEE that retry is happening, since
-        those uids are otherwise indistinguishable from never-attempted
-        ones once mixed into ``pending``."""
-        failed: Set[str] = set()
-        for rec in load_jsonl(self.items_path):
+        done:    finished without error and an answer was parsed -> skip.
+        retry:   has a record but not done -> stays in pending, retried
+                 automatically next run (no --rerun-failed needed).
+        correct: subset of done that was also correct (for progress baseline).
+        """
+        done: Set[str] = set()
+        retry: Set[str] = set()
+        correct: Set[str] = set()
+        for rec in items:
             uid = rec.get("uid")
-            if uid is not None and (rec.get("error") or rec.get("parsed_answer") is None):
-                failed.add(uid)
-        return failed
+            if uid is None:
+                continue
+            if rec.get("error") or rec.get("parsed_answer") is None:
+                retry.add(uid)
+            else:
+                done.add(uid)
+                if rec.get("is_correct"):
+                    correct.add(uid)
+        return done, retry, correct
+
+    def _progress_baseline(self, all_samples: List[Sample], done_uids: Set[str],
+                            correct_uids: Set[str]):
+        """(bar_total, initial_completed, initial_correct) so a resumed run's
+        progress bar continues the dataset-wide count instead of restarting
+        at 0. Falls back to per-invocation bar (None, 0, 0) when there's no
+        well-defined dataset-wide baseline to resume against (quickcheck or
+        shard mode — each shard only processes a subset of the full dataset).
+        """
+        if self.cfg.get("task_type_filter") or self.cfg.get("limit") \
+                or self.cfg.get("shard_id") is not None:
+            return None, 0, 0
+        return len(all_samples), len(done_uids), len(correct_uids)
 
     def _build_req(self, sample: Sample) -> InferenceRequest:
         return InferenceRequest(
             sample=sample,
             modality_mode=self.cfg.get("modality_mode", "av"),
             prompt_template=self.cfg.get("prompt_template"),
+            system_prompt=self.cfg.get("system_prompt"),
             generation_kwargs=self.cfg.get("generation", {}) or {},
         )
 
@@ -262,27 +287,40 @@ class Runner:
         if res.error:
             append_jsonl(self.failed_path, rec)
 
-    # ----- run modes
-    def _run_sequential(self, pending: List[Sample]) -> None:
-        with ProgressManager(len(pending), desc="Sequential") as pm:
-            for s in pending:
-                res = self._infer_one(s)
-                self._persist(res)
-                pm.update(is_failed=bool(res.error), is_correct=bool(res.is_correct))
+    def _persist_and_update(self, res: InferenceResult, pm: ProgressManager) -> None:
+        """Shared tail of every inference path below: persist the result,
+        then advance the progress bar with it — kept in one place so the
+        four call sites (sequential / threaded / batch-success /
+        batch-fallback) can't drift out of sync."""
+        self._persist(res)
+        pm.update(is_failed=bool(res.error), is_correct=bool(res.is_correct))
 
-    def _run_threaded(self, pending: List[Sample]) -> None:
+    # ----- run modes
+    # ``bar_total``/``bar_initial``/``bar_correct`` come from
+    # ``_progress_baseline()`` — ``bar_total=None`` means "no dataset-wide
+    # baseline available" (quickcheck runs), fall back to len(pending).
+    def _run_sequential(self, pending: List[Sample], bar_total: Optional[int] = None,
+                         bar_initial: int = 0, bar_correct: int = 0) -> None:
+        with ProgressManager(bar_total or len(pending), desc="Sequential",
+                              initial=bar_initial, initial_correct=bar_correct) as pm:
+            for s in pending:
+                self._persist_and_update(self._infer_one(s), pm)
+
+    def _run_threaded(self, pending: List[Sample], bar_total: Optional[int] = None,
+                       bar_initial: int = 0, bar_correct: int = 0) -> None:
         W = int(self.cfg.get("concurrency", {}).get("max_workers", 8))
-        with ProgressManager(len(pending), desc=f"Thread x{W}") as pm, \
+        with ProgressManager(bar_total or len(pending), desc=f"Thread x{W}",
+                              initial=bar_initial, initial_correct=bar_correct) as pm, \
                 ThreadPoolExecutor(max_workers=W) as pool:
             futures = [pool.submit(self._infer_one, s) for s in pending]
             for fut in as_completed(futures):
-                res = fut.result()
-                self._persist(res)
-                pm.update(is_failed=bool(res.error), is_correct=bool(res.is_correct))
+                self._persist_and_update(fut.result(), pm)
 
-    def _run_batched(self, pending: List[Sample]) -> None:
+    def _run_batched(self, pending: List[Sample], bar_total: Optional[int] = None,
+                      bar_initial: int = 0, bar_correct: int = 0) -> None:
         B = int(self.cfg.get("concurrency", {}).get("batch_size", 8))
-        with ProgressManager(len(pending), desc=f"Batch x{B}") as pm:
+        with ProgressManager(bar_total or len(pending), desc=f"Batch x{B}",
+                              initial=bar_initial, initial_correct=bar_correct) as pm:
             for i in range(0, len(pending), B):
                 batch = pending[i:i + B]
                 reqs = [self._build_req(s) for s in batch]
@@ -292,15 +330,11 @@ class Runner:
                 except Exception as e:
                     log.warning("Batch %d failed (%s); falling back to per-sample.", i, e)
                     for s in batch:
-                        res = self._infer_one(s)
-                        self._persist(res)
-                        pm.update(is_failed=bool(res.error), is_correct=bool(res.is_correct))
+                        self._persist_and_update(self._infer_one(s), pm)
                     continue
                 # split the batch's wall-clock time evenly across samples —
                 # not exact per-sample timing, but far better than the
                 # previous hardcoded 0.0
                 latency = (time.time() - t0) / max(len(batch), 1)
                 for s, raw in zip(batch, raws):
-                    res = self._build_result(s, raw or "", latency)
-                    self._persist(res)
-                    pm.update(is_failed=bool(res.error), is_correct=bool(res.is_correct))
+                    self._persist_and_update(self._build_result(s, raw or "", latency), pm)

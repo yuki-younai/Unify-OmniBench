@@ -11,12 +11,10 @@ Usage:
         --model-path gpt-4o --model-name gpt-4o
     python run.py --backend echo   --dataset daily_omni --model-name echo
 
-Results are saved to: ``results/<dataset>/<model_name>/``
+Results are saved to: ``results/<dataset>/<model_name>_<backend>_<mode>/``
 
-断点续跑是自动的、无需任何参数：同一个 run_dir（同样的 dataset/model-name/backend/
-mode 组合）再跑一次，已经成功完成的样本会被跳过，之前失败/未解析出答案的样本会
-自动重新推理——``Runner._compact_items()`` 会在每次开跑前清理掉同一 uid 的历史
-重复记录，保证 summary 统计不被污染。
+断点续跑/失败重测是自动的、无需任何参数：同一个 run_dir 再跑一次，已成功的样本
+会被跳过，失败/未解析出答案的样本会自动重新推理（见 ``Runner.run()``）。
 """
 from __future__ import annotations
 
@@ -80,6 +78,11 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="only evaluate samples whose meta.task_type matches this "
                         "value (e.g. 'Event Sequence'); combine with --limit for a "
                         "fast, targeted re-check of a specific failure category")
+    p.add_argument("--shard-id", type=int, default=None,
+                   help="0-based shard index (0..num_shards-1), used with "
+                        "--num-shards for multi-worker parallel eval")
+    p.add_argument("--num-shards", type=int, default=None,
+                   help="total number of shards, used with --shard-id")
     return p.parse_args(argv)
 
 
@@ -88,37 +91,24 @@ def main(argv=None) -> None:
 
     dataset_cfg = get_dataset_cfg(args.dataset)
     model_cfg = get_model_cfg(args.backend, model_path=args.model_path)
-    # dataset_config.yaml can set use_audio_in_video per dataset (flat field,
-    # sibling of data_file/modality) — it wins over the backend yaml's global
-    # default. e.g. omnivideobench needs True to match ITS OWN reference
-    # implementation (OmniVideoBench/eval/qwenomni_eval.py hardcodes True),
-    # while daily_omni/omnibench align with the transformer baseline (False).
+    # dataset_config.yaml 可以按数据集覆盖 use_audio_in_video（优先于 backend yaml
+    # 的全局默认值），例如 omnivideobench 需要 True 以对齐官方参考实现。
     if "use_audio_in_video" in dataset_cfg:
         model_cfg["use_audio_in_video"] = dataset_cfg["use_audio_in_video"]
-    # dataset-level video sampling override (fps/max_frames/min_frames) — wins
-    # over the backend yaml's global default. Applied at DECODE time (baked
-    # into the video content block itself, read by qwen_omni_utils's
-    # smart_nframes) rather than post-hoc cropping after decode+resize —
-    # see dataset_config.yaml's ``video:`` comment for why this matters.
+    # 同理，数据集级别的抽帧参数（fps/max_frames/min_frames）覆盖 backend 的全局默认值。
     if "video" in dataset_cfg:
         video_override = dict(dataset_cfg["video"] or {})
         model_cfg_video = dict(model_cfg.get("video") or {})
         model_cfg_video.update(video_override)
         model_cfg["video"] = model_cfg_video
-        # keep flat max_frames in sync too (used as the post-hoc safety-net
-        # cap in qwen25omni.py::_cap_video_frames, e.g. if the installed
-        # qwen_omni_utils version ignores the per-element max_frames key)
+        # 同步 flat 字段，作为 qwen25omni.py::_cap_video_frames 的事后裁剪安全网
         if "max_frames" in video_override:
             model_cfg["max_frames"] = int(video_override["max_frames"])
     if args.vllm_gpu_mem is not None and args.backend == "vllm":
         model_cfg["gpu_memory_utilization"] = args.vllm_gpu_mem
     if args.backend == "vllm":
-        # [2026-07-08] max_num_seqs（vLLM 引擎内部真实并发调度上限）直接跟
-        # --workers/WORKERS 走同一个值，不再在 vllm.yaml 里单独维护一份容易
-        # 失配的数字——concurrency.batch_size（下面）也是这个值，两者天生一致，
-        # 不用记得手动同步。⚠️ 意味着 WORKERS 调多大，vLLM 就会真的同时并发跑
-        # 多少条多模态请求（不再有 vllm.yaml 里旧的、更保守的默认值兜底），
-        # 显存吃紧时请直接调小 WORKERS。
+        # max_num_seqs（vLLM 引擎真实并发上限）直接跟 --workers 走同一个值，
+        # 跟下面 concurrency.batch_size 天然一致，不用单独维护。
         model_cfg["max_num_seqs"] = args.workers
     if args.api_url:
         model_cfg["base_url"] = args.api_url
@@ -126,14 +116,15 @@ def main(argv=None) -> None:
         model_cfg["api_key"] = args.api_key
 
     model_name = args.model_name or args.backend
-    # run_dir: results/<dataset>/<model_name>_<backend>_<mode>/
-    # NOTE: --limit/--task-type get a "_quickcheck" suffix so they write to an
-    # isolated results dir — never mixed into (or resumed from) the full run's
-    # items.jsonl, which would corrupt the full run's resume bookkeeping / summary.
+    # results/<dataset>/<model_name>_<backend>_<mode>/；--limit/--task-type 抽查
+    # 加 _quickcheck 后缀，写到独立目录，不混进完整评测的 items.jsonl。
+    # shard worker 写到 shard_N/ 子目录，跑完由合并脚本聚合成父目录。
     run_dir_name = f"{model_name}_{args.backend}_{args.mode}"
     if args.limit or args.task_type:
         run_dir_name += "_quickcheck"
     run_dir = os.path.join("results", args.dataset, run_dir_name)
+    if args.shard_id is not None and args.num_shards is not None:
+        run_dir = os.path.join(run_dir, f"shard_{args.shard_id}")
 
     gen_cfg = get_generation_cfg()
     if args.temperature is not None:
@@ -143,12 +134,9 @@ def main(argv=None) -> None:
     if args.max_new_tokens is not None:
         gen_cfg["max_new_tokens"] = args.max_new_tokens
 
-    # Resolve prompt_template.
-    # NOTE: --mode no longer auto-overrides max_new_tokens (that used to force
-    # 1024 for "cot"). Token budget is now controlled ONLY by --max-new-tokens
-    # (falling back to the hardcoded default of 10 when not passed), so the
-    # two concerns — prompt wording vs. token budget — are independent knobs.
+    # prompt 全部由 dataset_config.yaml 定义（--mode cot 只换 user prompt 文案）。
     prompt_template = dataset_cfg.get("prompt_template")
+    system_prompt = dataset_cfg.get("system_prompt")
     if args.mode == "cot":
         prompt_template = _USER_PROMPT_COT
 
@@ -160,9 +148,12 @@ def main(argv=None) -> None:
         "model": model_cfg,
         "generation": gen_cfg,
         "prompt_template": prompt_template,
+        "system_prompt": system_prompt,
         "infer_mode": args.mode,
         "limit": args.limit,
         "task_type_filter": args.task_type,
+        "shard_id": args.shard_id,
+        "num_shards": args.num_shards,
         "concurrency": {
             "mode": concurrency_for(args.backend),
             "max_workers": args.workers,

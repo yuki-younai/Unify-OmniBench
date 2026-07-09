@@ -97,39 +97,21 @@ model = OpenAIChatModel({
     "model": os.environ.get("MODEL_NAME", "Qwen2.5-Omni-7B"),
     "base_url": URL,
     "api_key": "EMPTY",
-    "system_prompt": (
-        "You are Qwen, a virtual human developed by the Qwen Team, "
-        "Alibaba Group, capable of perceiving auditory and visual inputs, "
-        "as well as generating text and speech."
-    ),
-    # video_mp4 + use_audio_in_video: 服务端从同一个mp4容器解出画面+音轨，音画时序
-    # 天然同步（与 config/models/openai.yaml 保持一致）
     "video": {"mode": "video_mp4", "num_frames": 128, "fps": 2},
     "audio": {"mode": "audio_url"},
-    "use_audio_in_video": False,  # 对齐 openai.yaml 当前默认值（daily_omni/omnibench）
+    "use_audio_in_video": False,  # 对齐 daily_omni/omnibench
 })
 model.load()
 
-# Second instance, identical except use_audio_in_video=True — mirrors the
-# dataset_config.yaml override used for omnivideobench (its own reference
-# implementation, OmniVideoBench/eval/qwenomni_eval.py, hardcodes True).
-# A SEPARATE instance (not mutating `model.use_audio_in_video` in place) so
-# both branches can be exercised independently and neither test leaks state
-# into the other (mirrors how the two real datasets get two different
-# model_cfg dicts at runtime via run.py's per-dataset override).
+# Second instance, identical except use_audio_in_video=True (omnivideobench).
 model_av_true = OpenAIChatModel({
     "name": "openai_chat",
     "model": os.environ.get("MODEL_NAME", "Qwen2.5-Omni-7B"),
     "base_url": URL,
     "api_key": "EMPTY",
-    "system_prompt": (
-        "You are Qwen, a virtual human developed by the Qwen Team, "
-        "Alibaba Group, capable of perceiving auditory and visual inputs, "
-        "as well as generating text and speech."
-    ),
     "video": {"mode": "video_mp4", "num_frames": 128, "fps": 2},
     "audio": {"mode": "audio_url"},
-    "use_audio_in_video": True,  # 对齐 omnivideobench 的 dataset_config.yaml 覆盖值
+    "use_audio_in_video": True,
 })
 model_av_true.load()
 

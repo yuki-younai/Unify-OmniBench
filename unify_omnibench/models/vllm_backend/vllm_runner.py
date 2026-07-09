@@ -1,6 +1,6 @@
 """Qwen2.5-Omni vLLM batch backend.
 
-Uses the **same** prompt / media construction as the Transformers backend
+Uses the *Omni-Bench-Work*same** prompt / media construction as the Transformers backend
 (:func:`~.local.qwen25omni.build_messages`). Only the generation engine
 differs. See ``docs/Unify-OmniBench-v0.1.0-dev.md`` for the full debugging
 history behind the choices below.
@@ -27,11 +27,11 @@ from typing import Any, Dict, List
 
 from ...core.registry import register_model
 from ...core.types import InferenceRequest
-from ...prompt.templates import PromptTemplate, QWEN_OMNI_DEFAULT
 from ...utils.logging import get_logger
 from ...utils.retry import retry
 from ..base import BaseModel
-from ..local.qwen25omni import build_messages, _try_import_process_mm_info
+from ..local.qwen25omni import build_messages
+from qwen_omni_utils import process_mm_info  # type: ignore
 
 log = get_logger(__name__)
 
@@ -56,24 +56,10 @@ class VLLMModel(BaseModel):
         # Disables vLLM's multi-modal processor cache — see vllm.yaml's
         # mm_processor_cache_gb comment / docs/Unify-OmniBench-v0.1.0-dev.md for why.
         self.mm_processor_cache_gb = float(cfg.get("mm_processor_cache_gb", 0))
-        # Video frame-sampling budget, shared with qwen25omni.py's config
-        # shape (fps/max_frames/min_frames + pixel-budget triple).
-        video_cfg = dict(cfg.get("video") or {})
-        self.video_kwargs: Dict[str, Any] = {
-            k: v for k, v in {
-                "fps": video_cfg.get("fps"),
-                "max_frames": video_cfg.get("max_frames"),
-                "min_frames": video_cfg.get("min_frames"),
-                "min_pixels": video_cfg.get("min_pixels"),
-                "max_pixels": video_cfg.get("max_pixels"),
-                "total_pixels": video_cfg.get("total_pixels"),
-            }.items() if v is not None
-        }
+        self.video_kwargs = self.parse_video_kwargs(cfg)
         self.use_audio_in_video = bool(cfg.get("use_audio_in_video", False))
-        self.prompt_template = PromptTemplate.from_config(cfg, QWEN_OMNI_DEFAULT)
         self.llm = None
         self.processor = None
-        self._process_mm_info = None
 
     def load(self) -> None:
         import os as _os
@@ -120,14 +106,8 @@ class VLLMModel(BaseModel):
         except TypeError:
             log.warning("Qwen2_5OmniProcessor.from_pretrained() 不支持 use_fast 参数，使用默认加载方式")
             self.processor = Qwen2_5OmniProcessor.from_pretrained(self.model_path)
-        self._process_mm_info = _try_import_process_mm_info()
 
     # -----------------------------------------------------------------
-    def _resolve_template(self, req: InferenceRequest) -> PromptTemplate:
-        if req.prompt_template:
-            return PromptTemplate(user=req.prompt_template, system=self.prompt_template.system)
-        return self.prompt_template
-
     def _make_sampling_params(self, max_tokens: int):
         from vllm import SamplingParams  # type: ignore
         return SamplingParams(temperature=0.0, top_p=1.0, top_k=-1, max_tokens=max_tokens)
@@ -201,9 +181,10 @@ class VLLMModel(BaseModel):
             gc.collect()
 
     def _build_one(self, req: InferenceRequest) -> Dict[str, Any]:
-        template = self._resolve_template(req)
         conv, _ = build_messages(
-            req.sample, req.modality_mode, template,
+            req.sample, req.modality_mode,
+            user_template=req.prompt_template or "",
+            system=req.system_prompt or "",
             use_audio_in_video=self.use_audio_in_video,
             video_kwargs=self.video_kwargs,
         )
@@ -211,21 +192,15 @@ class VLLMModel(BaseModel):
             conv, add_generation_prompt=True, tokenize=False
         )
         mm_data: Dict[str, Any] = {}
-        if self._process_mm_info is not None:
-            audios, images, videos = self._process_mm_info(
-                conv, use_audio_in_video=self.use_audio_in_video
-            )
-            # Unwrap single-item lists to bare objects — matches vLLM's own
-            # official multi-modal examples (a list value makes vLLM treat
-            # it as "multiple items of this modality" and route it through
-            # per-item content-hash bookkeeping we don't need here, since
-            # every sample has at most one video/audio/image).
-            if images:
-                mm_data["image"] = images[0] if len(images) == 1 else images
-            if videos:
-                mm_data["video"] = videos[0] if len(videos) == 1 else videos
-            if audios:
-                mm_data["audio"] = audios[0] if len(audios) == 1 else audios
+        audios, images, videos = process_mm_info(
+            conv, use_audio_in_video=self.use_audio_in_video
+        )
+        if images:
+            mm_data["image"] = images[0] if len(images) == 1 else images
+        if videos:
+            mm_data["video"] = videos[0] if len(videos) == 1 else videos
+        if audios:
+            mm_data["audio"] = audios[0] if len(audios) == 1 else audios
         return {
             "prompt": text,
             "multi_modal_data": mm_data,

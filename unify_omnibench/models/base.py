@@ -36,18 +36,22 @@ class BaseModel(ABC):
     def generate_batch(self, reqs: List[InferenceRequest]) -> List[str]:
         return [self.generate(r) for r in reqs]
 
-    # -------- helpers for child classes
+    # -------- helpers for qwen25omni / vllm local backends --------
     @staticmethod
-    def format_choices(choices) -> str:
-        if isinstance(choices, list):
-            return "\n".join(str(c) for c in choices)
-        return str(choices)
-
-    @classmethod
-    def default_prompt(cls, question: str, choices) -> str:
-        return (
-            "Answer the multiple-choice question. Reply with one capital letter "
-            "(A/B/C/D) only — no other text.\n\n"
-            f"Question: {question}\n"
-            f"Options:\n{cls.format_choices(choices)}"
-        )
+    def parse_video_kwargs(cfg: Dict[str, Any]) -> Dict[str, Any]:
+        """Extract ``{fps, max_frames, min_frames, ...}`` from cfg,
+        filtering out None values.  Shared by qwen25omni & vllm_runner.
+        These keys are merged into the video content block by
+        :func:`filter_media` and read by ``smart_nframes`` at decode time.
+        """
+        v = dict(cfg.get("video") or {})
+        return {
+            k: val for k, val in {
+                "fps":          v.get("fps"),
+                "max_frames":   v.get("max_frames"),
+                "min_frames":   v.get("min_frames"),
+                "min_pixels":   v.get("min_pixels"),
+                "max_pixels":   v.get("max_pixels"),
+                "total_pixels": v.get("total_pixels"),
+            }.items() if val is not None
+        }

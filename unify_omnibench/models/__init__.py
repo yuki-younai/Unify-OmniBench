@@ -9,10 +9,6 @@ try:
     from .api import openai_chat  # noqa: F401
 except Exception:  # pragma: no cover
     pass
-try:
-    from .api import gemini  # noqa: F401
-except Exception:  # pragma: no cover
-    pass
 
 # Local models — import path only; heavy deps in load()
 try:

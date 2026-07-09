@@ -6,11 +6,29 @@ datasets:
     data_file: data/omnibench.json
     modality: av
     use_audio_in_video: false
+    system_prompt: "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, capable of perceiving auditory and visual inputs, as well as generating text and speech."
+    prompt_template: |
+      Your task is to accurately answer multiple-choice questions based on the {media_desc}.
+      Select the single most accurate answer from the given choices.
+      Question: {question}
+      Choices: {choices}
+      Your answer should be a capital letter representing your choice: A, B, C, or D. Don't generate any other text.
+    video:
+      fps: 2.0
+      max_frames: 768
+      min_frames: 4
 
   daily_omni:
     data_file: data/daily_omni.json
     modality: av
     use_audio_in_video: false
+    system_prompt: "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, capable of perceiving auditory and visual inputs, as well as generating text and speech."
+    prompt_template: |
+      Your task is to accurately answer multiple-choice questions based on the {media_desc}.
+      Select the single most accurate answer from the given choices.
+      Question: {question}
+      Choices: {choices}
+      Your answer should be a capital letter representing your choice: A, B, C, or D. Don't generate any other text.
     video:
       fps: 2.0
       max_frames: 768
@@ -29,6 +47,7 @@ datasets:
       min_pixels: 100352
       max_pixels: 602112
       total_pixels: 36126720   # 90316800 * 32K/128K * 48/120，对应 per-frame 602K 上限
+    system_prompt: "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, capable of perceiving auditory and visual inputs, as well as generating text and speech."
     prompt_template: |
       You are given a video. Based on the content of the video, answer the following question:
 

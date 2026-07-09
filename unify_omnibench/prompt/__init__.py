@@ -10,11 +10,7 @@ from .media import (
     media_description,
     visual_label,
 )
-from .templates import (
-    PromptTemplate,
-    QWEN_OMNI_DEFAULT,
-    OPENAI_DEFAULT,
-)
+from .templates import PromptTemplate
 
 __all__ = [
     "ModalityClass",
@@ -23,6 +19,4 @@ __all__ = [
     "media_description",
     "visual_label",
     "PromptTemplate",
-    "QWEN_OMNI_DEFAULT",
-    "OPENAI_DEFAULT",
 ]
