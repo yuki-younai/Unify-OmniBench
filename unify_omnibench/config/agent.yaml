@@ -1,0 +1,19 @@
+# Agent ReAct 模式配置
+# 按 benchmark 单独覆盖（未覆盖项使用 default）
+# 也可通过 eval_react.sh 环境变量覆盖（MAX_STEPS_OVERRIDE 等）
+
+default:
+  max_steps: 32
+  max_frames_len: 60
+  max_audio_len: 300
+  max_clip_len: 60
+  dynamic_step: true
+  generation:
+    max_new_tokens: 4096
+    temperature: 1.0
+
+benchmarks:
+  daily_omni: {}
+  omnibench: {}
+  omnivideobench: {}
+  worldsense: {}

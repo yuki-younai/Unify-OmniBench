@@ -33,7 +33,7 @@ PYEOF
 BACKEND=transformer                               # openai | openai-omni | vllm | transformer | echo
 DATASETS=(daily_omni  omnibench)                    # 支持多个：DATASETS=(daily_omni omnibench)
 INFER_MODE=norm                              # norm | cot
-RUN_MODE=direct                              # direct | react
+RUN_MODE=react                              # direct | react
 MODEL_PATH=/apdcephfs_hldy/share_304318596/weiyangguo/models/Qwen2.5-Omni-3B    
 MODEL_NAME=Qwen2.5-Omni-3B                   # results/<DATASET>/<MODEL_NAME>_<BACKEND>_<MODE>/
 WORKERS=8                                    # batch_size；vllm 后端同时也是 max_num_seqs
@@ -41,7 +41,10 @@ API_URL=http://localhost:8001/v1             # API server 地址（openai 模式
 API_KEY=                                     # 空=本地vLLM / 非空=公有云
 TEMPERATURE=0.0                              # 空 = 默认 (0.0)
 TOP_P=                                       # 空 = 默认
-MAX_NEW_TOKENS=512                           # 空 = 默认 (10)
+MAX_NEW_TOKENS=4096                           # 空 = 默认 (10)
+
+# ── Agent ReAct 参数（其余在 config/agent.yaml） ──
+MAX_STEPS_OVERRIDE=${MAX_STEPS_OVERRIDE:-32}    # 覆盖最大步数（空=用 agent.yaml 默认 32）
 
 # ── 多 Worker 并行 ──
 GPUS_PER_WORKER=2                            # 0 = 所有 GPU 给一个 worker
@@ -49,6 +52,10 @@ GPUS_PER_WORKER=2                            # 0 = 所有 GPU 给一个 worker
 
 set -e
 cd "$(dirname "$0")"
+
+# 清理残留 GPU 进程
+fuser -k /dev/nvidia* 2>/dev/null || true
+sleep 2
 
 # 解析 GPU ID 列表
 GPU_LIST=(${CUDA_VISIBLE_DEVICES//,/ })

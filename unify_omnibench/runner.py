@@ -49,6 +49,11 @@ class Runner:
 
     # ------------------------------------------------------------------ public
     def run(self) -> Dict[str, Any]:
+        if self.cfg.get("run_mode") == "react":
+            from .agent.react_evaluator import ReActEvaluator
+            evaluator = ReActEvaluator(self.dataset, self.model, self.cfg)
+            return evaluator.run()
+
         log.info("Loading model: %s", self.model.name)
         self.model.load()
 

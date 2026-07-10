@@ -170,6 +170,27 @@ def get_generation_cfg() -> Dict[str, Any]:
     return dict(_DEFAULT_GENERATION_CFG)
 
 
+def get_agent_cfg(bench: str) -> Dict[str, Any]:
+    """Load agent ReAct config from config/agent.yaml, merged per-benchmark."""
+    path = os.path.join(_CFG_DIR, "agent.yaml")
+    if not os.path.exists(path):
+        return {}
+    raw = _load_yaml(path)
+    defaults = raw.get("default", {})
+    bench_cfg = raw.get("benchmarks", {}).get(bench, {})
+    merged = dict(defaults)
+    _deep_update(merged, bench_cfg)
+    return merged
+
+
+def _deep_update(base: Dict[str, Any], override: Dict[str, Any]) -> None:
+    for k, v in override.items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            _deep_update(base[k], v)
+        else:
+            base[k] = v
+
+
 __all__ = [
     "list_datasets",
     "list_backends",
@@ -177,4 +198,5 @@ __all__ = [
     "get_model_cfg",
     "concurrency_for",
     "get_generation_cfg",
+    "get_agent_cfg",
 ]

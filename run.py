@@ -28,6 +28,7 @@ from unify_omnibench import models    # noqa: F401
 from unify_omnibench.prompt.templates import _USER_PROMPT_COT  # noqa: F401
 from unify_omnibench.config import (
     concurrency_for,
+    get_agent_cfg,
     get_dataset_cfg,
     get_generation_cfg,
     get_model_cfg,
@@ -56,6 +57,9 @@ def parse_args(argv=None) -> argparse.Namespace:
                         "(default: backend name)")
     p.add_argument("--mode", default="norm", choices=("norm", "cot"),
                    help="inference mode: norm (direct answer) | cot (chain-of-thought)")
+    p.add_argument("--run-mode", default="direct", choices=("direct", "react"),
+                   dest="run_mode",
+                   help="evaluation mode: direct (single-shot) | react (multi-turn agent)")
 
     p.add_argument("--workers", type=int, default=8)
     p.add_argument("--temperature", type=float, default=None,
@@ -150,6 +154,14 @@ def main(argv=None) -> None:
         "prompt_template": prompt_template,
         "system_prompt": system_prompt,
         "infer_mode": args.mode,
+        "run_mode": args.run_mode,
+        "react": get_agent_cfg(args.dataset),
+
+        # react 环境变量覆盖（从 eval_react.sh 传入）
+        "_react_env_overrides": {
+            k: os.environ[k] for k in ("MAX_STEPS_OVERRIDE",)
+            if k in os.environ
+        },
         "limit": args.limit,
         "task_type_filter": args.task_type,
         "shard_id": args.shard_id,
