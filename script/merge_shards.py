@@ -4,12 +4,14 @@ Usage:
     python script/merge_shards.py \\
         --result-dir results/omnivideobench/Qwen2.5-Omni-7B_vllm_norm \\
         --num-shards 2 \\
-        --dataset omnivideobench
+        --dataset omnivideobench \\
+        --cleanup                # remove shard_N/ dirs after merge
 """
 from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import sys
 
 from unify_omnibench.eval.report import write_summary
@@ -18,12 +20,11 @@ from unify_omnibench.utils.io import load_jsonl, rewrite_jsonl
 
 def main() -> None:
     p = argparse.ArgumentParser(description="Merge multi-worker shard results")
-    p.add_argument("--result-dir", required=True,
-                   help="parent results directory (e.g. results/dataset/model_backend_mode/)")
-    p.add_argument("--num-shards", type=int, required=True,
-                   help="total number of shards/workers")
-    p.add_argument("--dataset", required=True,
-                   help="dataset name (for summary)")
+    p.add_argument("--result-dir", required=True)
+    p.add_argument("--num-shards", type=int, required=True)
+    p.add_argument("--dataset", required=True)
+    p.add_argument("--cleanup", action="store_true",
+                   help="remove shard_N/ directories after merge")
     args = p.parse_args()
 
     parent = args.result_dir
@@ -67,6 +68,13 @@ def main() -> None:
 
     summary = write_summary(items_path, out_dir=parent, dataset_name=args.dataset)
     print(f"  [merge] total={summary['total']} accuracy={summary['accuracy']:.2%}")
+
+    if args.cleanup:
+        for i in range(args.num_shards):
+            d = os.path.join(parent, f"shard_{i}")
+            if os.path.isdir(d):
+                shutil.rmtree(d)
+                print(f"  [cleanup] removed {d}")
 
 
 if __name__ == "__main__":

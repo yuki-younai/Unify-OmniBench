@@ -81,15 +81,16 @@ class Runner:
             ]
             log.info("Filtered to task_type=%r: %d pending samples", task_type_filter, len(pending))
 
-        # 多 worker 分片：每个 worker 只负责 hash(uid) % num_shards == shard_id 的样本。
-        # 使用 hash 而非下标切分，保证同一个 uid 无论 resume 多少次都落在同一个
-        # worker 上（断点续跑正确性），且 shard 间负载天然均匀。
+        # 多 worker 分片：每个 worker 只负责 uid 的 MD5 % num_shards 命中归属的样本。
+        # 注意：不能用 Python 内置 hash()——它默认每进程不同（PYTHONHASHSEED），
+        # 会导致同一 uid 在不同 worker 进程算出不同 hash、同时落入多个 shard。
         shard_id = self.cfg.get("shard_id")
         num_shards = self.cfg.get("num_shards")
         if shard_id is not None and num_shards is not None:
+            import hashlib
             pending = [
                 s for s in pending
-                if abs(hash(s.uid)) % int(num_shards) == int(shard_id)
+                if int(hashlib.md5(s.uid.encode()).hexdigest(), 16) % int(num_shards) == int(shard_id)
             ]
             log.info("Shard %d/%d: %d pending samples after shard filter",
                      int(shard_id), int(num_shards), len(pending))

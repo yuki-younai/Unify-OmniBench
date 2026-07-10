@@ -59,6 +59,25 @@ datasets:
 
       Answer with the option's letter directly(e.g., A, B, C, or D).If your access to the video content is limited, at least one option that is more likely than the others must be chosen.Mustn't give any other reason for can not choose!
 
+  videomme:
+    data_file: data/videomme.json
+    modality: v
+    use_audio_in_video: false
+    video:
+      fps: 2.0
+      max_frames: 64           # 对齐 VLMEvalKit 默认 64frame 预设
+      min_frames: 4
+      min_pixels: 100352
+      max_pixels: 602112
+      total_pixels: 19267584
+    system_prompt: "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, capable of perceiving visual inputs, as well as generating text and speech."
+    prompt_template: |
+      These are the frames of a video. Select the best answer to the following multiple-choice question based on the video. Respond with only the letter (A, B, C, or D) of the correct option.
+
+      Question: {question}
+      {choices}
+      Answer:
+
   worldsense:
     data_file: data/worldsense.json
     modality: av

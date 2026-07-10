@@ -11,19 +11,31 @@
 #   GPUS_PER_WORKER=2          → 4 张 GPU → 2 个 worker，每个独占 2 张 GPU
 #   样本按 hash(uid) % num_workers 分配，跑完自动合并 shard 结果
 
-#export CUDA_VISIBLE_DEVICES=4,5,6,7   
-export CUDA_VISIBLE_DEVICES=0,1,2,3
+export CUDA_VISIBLE_DEVICES=4,5,6,7   
+#export CUDA_VISIBLE_DEVICES=0,1,2,3
+
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export VLLM_DISABLE_PROGRESS_BAR=1
-# 让 vLLM spawn 出来的 worker 子进程也吃到 sitecustomize.py 的兼容性补丁
-export PYTHONPATH="$(cd "$(dirname "$0")" && pwd):${PYTHONPATH:-}"
+# vLLM spawn worker 子进程兼容性补丁：某些 transformers 版本删除了
+# all_special_tokens_extended，但 vLLM 的 tokenizer 缓存代码仍会访问。
+# PYTHONSTARTUP 在每个 Python 进程（含 spawn 子进程）启动时自动执行。
+export PYTHONSTARTUP=<(cat <<'PYEOF'
+try:
+    from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+    if not hasattr(PreTrainedTokenizerBase, "all_special_tokens_extended"):
+        PreTrainedTokenizerBase.all_special_tokens_extended = property(
+            lambda self: self.all_special_tokens)
+except Exception:
+    pass
+PYEOF
+)
 
-BACKEND=vllm                                 # openai | openai-omni | vllm | transformer | echo
-DATASETS=(omnivideobench)                    # 支持多个：DATASETS=(daily_omni omnibench)
+BACKEND=transformer                               # openai | openai-omni | vllm | transformer | echo
+DATASETS=(daily_omni  omnibench)                    # 支持多个：DATASETS=(daily_omni omnibench)
 INFER_MODE=norm                              # norm | cot
-MODEL_PATH=/apdcephfs_hldy/share_304318596/weiyangguo/models/Qwen2.5-Omni-7B    
-MODEL_NAME=Qwen2.5-Omni-7B                   # results/<DATASET>/<MODEL_NAME>_<BACKEND>_<MODE>/
-WORKERS=1                                    # batch_size；vllm 后端同时也是 max_num_seqs
+MODEL_PATH=/apdcephfs_hldy/share_304318596/weiyangguo/models/Qwen2.5-Omni-3B    
+MODEL_NAME=Qwen2.5-Omni-3B                   # results/<DATASET>/<MODEL_NAME>_<BACKEND>_<MODE>/
+WORKERS=8                                    # batch_size；vllm 后端同时也是 max_num_seqs
 API_URL=http://localhost:8001/v1             # API server 地址（openai 模式用）
 API_KEY=                                     # 空=本地vLLM / 非空=公有云
 TEMPERATURE=0.0                              # 空 = 默认 (0.0)
@@ -36,7 +48,6 @@ GPUS_PER_WORKER=2                            # 0 = 所有 GPU 给一个 worker
 
 set -e
 cd "$(dirname "$0")"
-mkdir -p logs
 
 # 解析 GPU ID 列表
 GPU_LIST=(${CUDA_VISIBLE_DEVICES//,/ })
@@ -44,6 +55,9 @@ NUM_GPUS=${#GPU_LIST[@]}
 
 for DATASET in "${DATASETS[@]}"; do
   echo "=== [$(date '+%H:%M:%S')] dataset=$DATASET mode=$INFER_MODE ==="
+
+  RESULT_DIR="results/$DATASET/${MODEL_NAME}_${BACKEND}_${INFER_MODE}"
+  mkdir -p "$RESULT_DIR"
 
   # worker 数：GPU 后端按 GPUS_PER_WORKER 计算，其他后端固定 1
   IS_GPU_BACKEND=false
@@ -84,7 +98,7 @@ for DATASET in "${DATASETS[@]}"; do
       ${TEMPERATURE:+--temperature "$TEMPERATURE"} \
       ${TOP_P:+--top-p "$TOP_P"} \
       ${MAX_NEW_TOKENS:+--max-new-tokens "$MAX_NEW_TOKENS"} \
-      > "logs/${DATASET}_worker${i}.log" 2>&1 &
+      > "$RESULT_DIR/worker${i}.log" 2>&1 &
     PIDS+=($!)
   done
 
@@ -95,12 +109,12 @@ for DATASET in "${DATASETS[@]}"; do
 
   # 合并 shard 结果（仅多 worker 时需要）
   if $IS_GPU_BACKEND; then
-    RESULT_DIR="results/$DATASET/${MODEL_NAME}_${BACKEND}_${INFER_MODE}"
     python3 script/merge_shards.py \
       --result-dir "$RESULT_DIR" \
       --num-shards "$NUM_WORKERS" \
       --dataset "$DATASET" \
-      2>&1 | tee -a "logs/merge_${DATASET}.log"
+      --cleanup \
+      2>&1 | tee -a "$RESULT_DIR/merge.log"
   fi
 done
 
