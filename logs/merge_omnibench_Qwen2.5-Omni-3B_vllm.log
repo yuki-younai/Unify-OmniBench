@@ -1,5 +1,0 @@
-  [merge] shard_0: 550 records
-  [merge] shard_1: 592 records
-  [merge] total=1142 accuracy=41.94%
-  [cleanup] removed results/omnibench/Qwen2.5-Omni-3B_vllm_norm/shard_0
-  [cleanup] removed results/omnibench/Qwen2.5-Omni-3B_vllm_norm/shard_1

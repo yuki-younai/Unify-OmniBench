@@ -20,6 +20,9 @@ BRANCH="$(git branch --show-current)"
 export http_proxy="${http_proxy:-http://star-proxy.oa.com:3128}"
 export https_proxy="${https_proxy:-$http_proxy}"
 
+git remote set-url origin https://github.com/yuki-younai/Unify-OmniBench
+
+
 # ── 2. 确保 .gitignore 含 results/ 与 __pycache__/ ──
 touch .gitignore
 need_clean=0
