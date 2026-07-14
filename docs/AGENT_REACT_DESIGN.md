@@ -190,7 +190,89 @@ class VideoEnv:
     def _get_clip(self, start, end): ...
 ```
 
-### 3.4 Prompt 模板 — `prompt.py`
+### 3.4 工具详情：输出格式与音视频模式
+
+Agent 每轮调用工具后，工具产出的媒体文件会以内联 content block 的形式追加到下一轮对话的 user message 中。**Agent 模式不使用 `use_audio_in_video` 配置**——每轮输入是动态构建的多模态数组，视频/音频/图片可以任意混排。
+
+#### 3.4.1 `get_frames` — 提取关键帧
+
+```
+ffmpeg -ss <start> -i <video> -frames:v 1 -q:v 2 <ts>.jpg  (逐帧)
+```
+
+| 属性 | 说明 |
+|---|---|
+| 输出格式 | 多张 JPEG 图片 |
+| 帧数上限 | `max_frames_len`（默认 60） |
+| 输入给模型的格式 | `{"type": "image", "image": "/tmp/agent_xxx/step_N/0.000.jpg"}` 多个 image block |
+
+**音视频模式**：纯视觉，不涉及音频。等效于 OmniBench 的图片输入模式。
+
+#### 3.4.2 `get_audio` — 提取音频片段
+
+```
+ffmpeg -ss <start> -i <video> -t <dur> -map 0:a:0? -vn -ac 1 -ar 16000 audio.wav
+```
+
+| 属性 | 说明 |
+|---|---|
+| 输出格式 | 单声道 16kHz WAV 音频 |
+| 时长上限 | `max_audio_len`（默认 300s） |
+| 输入给模型的格式 | `{"type": "audio", "audio": "/tmp/agent_xxx/step_N/audio.wav"}` 单个 audio block |
+
+**音视频模式**：纯音频独立输入。等效于 Daily-Omni/OmniBench 的"双路并列"模式中独立音频流那一路——音频从视频容器音轨按时间戳裁剪出来，作为独立 stream 发送，不走 `use_audio_in_video=True` 的交织编码。
+
+#### 3.4.3 `get_clip` — 提取视频片段
+
+```
+ffmpeg -ss <start> -i <video> -t <dur> -map 0:v:0? -map 0:a:0? -c copy clip.mp4
+```
+
+| 属性 | 说明 |
+|---|---|
+| 输出格式 | 含视频轨 + 音频轨的 MP4 片段（流拷贝，无需重编码） |
+| 时长上限 | `max_clip_len`（默认 60s） |
+| 输入给模型的格式 | `{"type": "video", "video": "/tmp/agent_xxx/step_N/clip.mp4"}` 单个 video block |
+
+**音视频模式**：视频片段自带音轨，后续 `process_mm_info(conv, use_audio_in_video=True)` 按时间戳从片段容器中交织提取音视频。等效于 OmniVideoBench/WorldSense 的交织模式。
+
+#### 3.4.4 `answer` — 提交答案
+
+```
+{"type": "answer", "content": "A"}
+```
+
+不产生媒体，直接结束循环。答案格式与 direct 模式一致（MCQ 用大写字母）。
+
+#### 3.4.5 多轮对话中的媒体混排
+
+Agent 模式的核心特征是**动态多模态对话**——每轮 user message 可能同时包含多种媒体：
+
+```
+Turn 1: user = [text]                              # 纯文本（初始问题）
+Turn 2: user = [text, image×8]                     # get_frames 返回的 8 张图
+Turn 3: user = [text, audio]                       # get_audio 返回的音频
+Turn 4: user = [text, video]                       # get_clip 返回的视频片段
+Turn 5: user = [text]                              # 可能不再需要新媒体
+```
+
+这与 direct 模式的根本区别在于：
+- **Direct 模式**：一次喂入全部媒体（video + audio），固定格式
+- **Agent 模式**：逐步按需请求媒体，**每轮格式可能不同**，`use_audio_in_video` 的概念在此不适用——音频来自 `get_audio` 就是独立 stream，音视频来自 `get_clip` 就是交织 stream，完全由工具产出决定。
+
+详见 `react_evaluator.py` 第 140-150 行：
+```python
+# 追加工具产出的媒体到 user message
+for m in result.media:
+    if m.kind == "image":
+        messages[-1]["content"].append({"type": "image", "image": m.path})
+    elif m.kind == "audio":
+        messages[-1]["content"].append({"type": "audio", "audio": m.path})
+    elif m.kind == "video":
+        messages[-1]["content"].append({"type": "video", "video": m.path})
+```
+
+### 3.6 Prompt 模板 — `prompt.py`
 
 ```python
 SYSTEM_PROMPT = """You are an AI agent with visual and audio perception capabilities.

@@ -42,7 +42,7 @@ datasets:
     # （1/4），按比例缩帧数+像素预算，避免 prompt 超 max_model_len=32768
     video:
       fps: 2.0
-      max_frames: 48           # 120 * 32K/128K ≈ 30，稍宽裕取 48
+      max_frames: 64          # 120 * 32K/128K ≈ 30，稍宽裕取 48
       min_frames: 4
       min_pixels: 100352
       max_pixels: 602112
@@ -87,7 +87,7 @@ datasets:
     use_audio_in_video: true
     video:
       fps: 2.0  # 对齐 VLMEvalKit（Qwen2VLChat 模型默认 fps=2）
-      max_frames: 256  # 长视频（>8min）防显存溢出的安全网
+      max_frames: 64  # 对齐 VLMEvalKit Qwen2-VL 默认值
       min_frames: 4
       min_pixels: 100352
       max_pixels: 602112

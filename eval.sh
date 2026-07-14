@@ -2,7 +2,7 @@
 # Unify-OmniBench launcher.
 #
 # Backends: transformer | vllm (本地GPU) | openai | openai-omni (API/服务端) | echo (smoke-test)
-# Datasets: daily_omni  omnibench  omnivideobench  worldsense（DATASETS=(a b) 可批量跑）
+# Datasets: daily_omni  omnibench  omnivideobench  worldsense videomme（DATASETS=(a b) 可批量跑）
 # Modes: norm (直出答案) | cot (思维链，建议配合更大的 MAX_NEW_TOKENS)
 # 结果目录: results/<dataset>/<model_name>_<backend>_<mode>/
 #
@@ -11,46 +11,34 @@
 #   GPUS_PER_WORKER=2          → 4 张 GPU → 2 个 worker，每个独占 2 张 GPU
 #   样本按 hash(uid) % num_workers 分配，跑完自动合并 shard 结果
 
-export CUDA_VISIBLE_DEVICES=4,5,6,7   
-#export CUDA_VISIBLE_DEVICES=0,1,2,3
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7   
 
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export VLLM_DISABLE_PROGRESS_BAR=1
-# vLLM spawn worker 子进程兼容性补丁：某些 transformers 版本删除了
-# all_special_tokens_extended，但 vLLM 的 tokenizer 缓存代码仍会访问。
-# PYTHONSTARTUP 在每个 Python 进程（含 spawn 子进程）启动时自动执行。
-export PYTHONSTARTUP=<(cat <<'PYEOF'
-try:
-    from transformers.tokenization_utils_base import PreTrainedTokenizerBase
-    if not hasattr(PreTrainedTokenizerBase, "all_special_tokens_extended"):
-        PreTrainedTokenizerBase.all_special_tokens_extended = property(
-            lambda self: self.all_special_tokens)
-except Exception:
-    pass
-PYEOF
-)
+export PYTHONPATH="$(cd "$(dirname "$0")" && pwd):${PYTHONPATH:-}"
+PYTHON=${PYTHON:-python3.12}
 
 BACKEND=transformer                               # openai | openai-omni | vllm | transformer | echo
-DATASETS=(daily_omni  omnibench)                    # 支持多个：DATASETS=(daily_omni omnibench)
+DATASETS=(daily_omni  omnibench omnivideobench  worldsense videomme)                    # 支持多个：DATASETS=(daily_omni omnibench)
 INFER_MODE=norm                              # norm | cot
 RUN_MODE=direct                              # direct | react
-MODEL_PATH=/apdcephfs_hldy/share_304318596/weiyangguo/models/Qwen2.5-Omni-3B    
-MODEL_NAME=Qwen2.5-Omni-3B                   # results/<DATASET>/<MODEL_NAME>_<BACKEND>_<MODE>/
-WORKERS=8                                    # batch_size；vllm 后端同时也是 max_num_seqs
+MODEL_PATH=/apdcephfs_hldy/share_304318596/weiyangguo/models/Qwen2.5-Omni-7B    
+MODEL_NAME=Qwen2.5-Omni-7B                   # results/<DATASET>/<MODEL_NAME>_<BACKEND>_<MODE>/
+WORKERS=1                                    # batch_size；vllm 后端同时也是 max_num_seqs
 API_URL=http://localhost:8001/v1             # API server 地址（openai 模式用）
 API_KEY=                                     # 空=本地vLLM / 非空=公有云
 TEMPERATURE=0.0                              # 空 = 默认 (0.0)
 TOP_P=                                       # 空 = 默认
 MAX_NEW_TOKENS=512                           # 空 = 默认 (10)
 
-# ── 多 Worker 并行 ──
-GPUS_PER_WORKER=2                            # 0 = 所有 GPU 给一个 worker
-                                             # >0 = 每个 worker 独占 N 张 GPU
+# ── Multi-Worker ──
+GPUS_PER_WORKER=1                            # 0 = all GPUs for one worker
+                                             # >0 = N GPUs per worker
 
-set -e
+set -eo pipefail
 cd "$(dirname "$0")"
 
-# 解析 GPU ID 列表
+# parse GPU ID list
 GPU_LIST=(${CUDA_VISIBLE_DEVICES//,/ })
 NUM_GPUS=${#GPU_LIST[@]}
 
@@ -58,9 +46,16 @@ for DATASET in "${DATASETS[@]}"; do
   echo "=== [$(date '+%H:%M:%S')] dataset=$DATASET mode=$INFER_MODE ==="
 
   RESULT_DIR="results/$DATASET/${MODEL_NAME}_${BACKEND}_${INFER_MODE}"
+
+  # skip if already completed
+  if SKIP_MSG=$($PYTHON script/check_completed.py --result-dir "$RESULT_DIR" 2>/dev/null); then
+    echo "  [skip] already completed (accuracy=$SKIP_MSG), no failed samples — skipping"
+    continue
+  fi
+
   mkdir -p "$RESULT_DIR"
 
-  # worker 数：GPU 后端按 GPUS_PER_WORKER 计算，其他后端固定 1
+  # worker count: GPU backends use GPUS_PER_WORKER, others fixed to 1
   IS_GPU_BACKEND=false
   if { [ "$BACKEND" = "vllm" ] || [ "$BACKEND" = "transformer" ]; }; then
     IS_GPU_BACKEND=true
@@ -86,7 +81,7 @@ for DATASET in "${DATASETS[@]}"; do
     fi
 
     env $SHARD_ENV \
-    python run.py \
+    $PYTHON run.py \
       --backend "$BACKEND" \
       --dataset "$DATASET" \
       --model-name "$MODEL_NAME" \
@@ -105,13 +100,16 @@ for DATASET in "${DATASETS[@]}"; do
   done
 
   for pid in "${PIDS[@]}"; do
-    wait "$pid" || echo "WARNING: worker pid=$pid exited with code $?"
+    # `set -e` would kill the script if wait returns non-zero.
+    # Use `|| true` to suppress that, then check the real exit code.
+    wait "$pid" && continue
+    echo "WARNING: worker pid=$pid exited with code $?"
   done
   echo "=== [$(date '+%H:%M:%S')] all $NUM_WORKERS workers done for $DATASET ==="
 
-  # 合并 shard 结果（仅多 worker 时需要）
+  # merge shard results (multi-worker only)
   if $IS_GPU_BACKEND; then
-    python3 script/merge_shards.py \
+    $PYTHON script/merge_shards.py \
       --result-dir "$RESULT_DIR" \
       --num-shards "$NUM_WORKERS" \
       --dataset "$DATASET" \
@@ -120,7 +118,7 @@ for DATASET in "${DATASETS[@]}"; do
   fi
 done
 
-echo "=== 全部完成: ${DATASETS[*]} ==="
+echo "=== All done: ${DATASETS[*]} ==="
 
-# 自动生成 results/summary.md 聚合总表
-python3 "$(dirname "$0")/script/aggregate_results.py"
+# auto-generate results/summary.md
+$PYTHON "$(dirname "$0")/script/aggregate_results.py"

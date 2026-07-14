@@ -103,9 +103,9 @@ from transformers import (
 
 model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
     MODEL_PATH,
-    torch_dtype=torch.bfloat16,
+    dtype=torch.float16,
     device_map="auto",
-    attn_implementation="flash_attention_2",
+    attn_implementation="eager",
     # Without this, the full Talker+Token2Wav TTS pipeline gets loaded and
     # generate() below will ALSO run autoregressive speech-token generation +
     # DiT vocoder synthesis after the text tokens — far slower than pure text

@@ -34,29 +34,46 @@ def main() -> None:
     items_path = os.path.join(parent, "items.jsonl")
     failed_path = os.path.join(parent, "failed.jsonl")
 
-    all_items = []
+    # Load existing parent results first (from a previous run), then
+    # merge in new shard results.  New records override old by uid so
+    # that partial re-runs (retry failed samples) don't discard the
+    # already-completed results.
+    if os.path.exists(items_path):
+        existing = load_jsonl(items_path)
+        print(f"  [merge] loaded {len(existing)} existing records from "
+              f"parent items.jsonl")
+    else:
+        existing = []
+
+    new_recs = []
     for i in range(args.num_shards):
         shard_path = os.path.join(parent, f"shard_{i}", "items.jsonl")
         if not os.path.exists(shard_path):
             print(f"  [merge] shard_{i}: SKIP (no items.jsonl)")
             continue
         recs = load_jsonl(shard_path)
-        all_items.extend(recs)
+        new_recs.extend(recs)
         print(f"  [merge] shard_{i}: {len(recs)} records")
 
-    if not all_items:
+    if not new_recs and not existing:
         sys.exit("no shard data found — did all workers fail?")
 
-    # dedup (each shard is already compacted internally; this is a safety net)
+    if not new_recs:
+        print("  [merge] all shards empty — reusing existing parent "
+              f"results ({len(existing)} records)")
+
+    # dedup: new records override old ones by uid
     seen = {}
-    for rec in all_items:
+    for rec in existing:
+        uid = rec.get("uid")
+        if uid is not None:
+            seen[uid] = rec
+    for rec in new_recs:
         uid = rec.get("uid")
         if uid is not None:
             seen[uid] = rec
     deduped = list(seen.values())
-    dropped = len(all_items) - len(deduped)
-    if dropped:
-        print(f"  [merge] dropped {dropped} duplicate record(s) across shards")
+    updated = sum(1 for r in new_recs if r.get("uid") in seen)
 
     rewrite_jsonl(items_path, deduped)
 

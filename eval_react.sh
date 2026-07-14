@@ -11,32 +11,20 @@
 #   GPUS_PER_WORKER=2          → 4 张 GPU → 2 个 worker，每个独占 2 张 GPU
 #   样本按 hash(uid) % num_workers 分配，跑完自动合并 shard 结果
 
-export CUDA_VISIBLE_DEVICES=4,5,6,7   
-#export CUDA_VISIBLE_DEVICES=0,1,2,3
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7   
 
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export VLLM_DISABLE_PROGRESS_BAR=1
-# vLLM spawn worker 子进程兼容性补丁：某些 transformers 版本删除了
-# all_special_tokens_extended，但 vLLM 的 tokenizer 缓存代码仍会访问。
-# PYTHONSTARTUP 在每个 Python 进程（含 spawn 子进程）启动时自动执行。
-export PYTHONSTARTUP=<(cat <<'PYEOF'
-try:
-    from transformers.tokenization_utils_base import PreTrainedTokenizerBase
-    if not hasattr(PreTrainedTokenizerBase, "all_special_tokens_extended"):
-        PreTrainedTokenizerBase.all_special_tokens_extended = property(
-            lambda self: self.all_special_tokens)
-except Exception:
-    pass
-PYEOF
-)
+export PYTHONPATH="$(cd "$(dirname "$0")" && pwd):${PYTHONPATH:-}"
+PYTHON=${PYTHON:-python}
 
-BACKEND=transformer                               # openai | openai-omni | vllm | transformer | echo
-DATASETS=(daily_omni  omnibench)                    # 支持多个：DATASETS=(daily_omni omnibench)
+BACKEND=vllm                               # openai | openai-omni | vllm | transformer | echo
+DATASETS=(daily_omni omnibench)                    # 支持多个：DATASETS=(daily_omni omnibench)
 INFER_MODE=norm                              # norm | cot
 RUN_MODE=react                              # direct | react
 MODEL_PATH=/apdcephfs_hldy/share_304318596/weiyangguo/models/Qwen2.5-Omni-3B    
 MODEL_NAME=Qwen2.5-Omni-3B                   # results/<DATASET>/<MODEL_NAME>_<BACKEND>_<MODE>/
-WORKERS=8                                    # batch_size；vllm 后端同时也是 max_num_seqs
+WORKERS=4                                    # batch_size；vllm 后端同时也是 max_num_seqs
 API_URL=http://localhost:8001/v1             # API server 地址（openai 模式用）
 API_KEY=                                     # 空=本地vLLM / 非空=公有云
 TEMPERATURE=0.0                              # 空 = 默认 (0.0)
@@ -47,10 +35,9 @@ MAX_NEW_TOKENS=4096                           # 空 = 默认 (10)
 MAX_STEPS_OVERRIDE=${MAX_STEPS_OVERRIDE:-32}    # 覆盖最大步数（空=用 agent.yaml 默认 32）
 
 # ── 多 Worker 并行 ──
-GPUS_PER_WORKER=2                            # 0 = 所有 GPU 给一个 worker
+GPUS_PER_WORKER=1                            # 0 = 所有 GPU 给一个 worker
                                              # >0 = 每个 worker 独占 N 张 GPU
-
-set -e
+set -eo pipefail
 cd "$(dirname "$0")"
 
 # 清理残留 GPU 进程
@@ -93,7 +80,7 @@ for DATASET in "${DATASETS[@]}"; do
     fi
 
     env $SHARD_ENV \
-    python run.py \
+    $PYTHON run.py \
       --backend "$BACKEND" \
       --dataset "$DATASET" \
       --model-name "$MODEL_NAME" \
@@ -118,7 +105,7 @@ for DATASET in "${DATASETS[@]}"; do
 
   # 合并 shard 结果（仅多 worker 时需要）
   if $IS_GPU_BACKEND; then
-    python3 script/merge_shards.py \
+    $PYTHON script/merge_shards.py \
       --result-dir "$RESULT_DIR" \
       --num-shards "$NUM_WORKERS" \
       --dataset "$DATASET" \
@@ -130,4 +117,4 @@ done
 echo "=== 全部完成: ${DATASETS[*]} ==="
 
 # 自动生成 results/summary.md 聚合总表
-python3 "$(dirname "$0")/script/aggregate_results.py"
+$PYTHON "$(dirname "$0")/script/aggregate_results.py"

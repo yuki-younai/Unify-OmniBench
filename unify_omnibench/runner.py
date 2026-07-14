@@ -60,10 +60,14 @@ class Runner:
         # 清理上一轮遗留的重复/过期记录（失败样本会自动重跑，见 _scan_items）。
         self._compact_items()
 
+        # 断点续跑：先读本 shard 的 items.jsonl；若被 merge+cleanup 删了，
+        # 从父目录的 items.jsonl 恢复（按 shard_id 过滤出本 worker 负责的 uid）。
+        items = self._load_resume_items()
+
         all_samples: List[Sample] = list(self.dataset)
         log.info("Dataset '%s' loaded: %d samples", self.dataset.name, len(all_samples))
 
-        done_uids, retry_uids, correct_uids = self._scan_items(load_jsonl(self.items_path))
+        done_uids, retry_uids, correct_uids = self._scan_items(items)
         if done_uids:
             log.info("Resume: skipping %d already-finished samples", len(done_uids))
         pending = [s for s in all_samples if s.uid not in done_uids]
@@ -195,6 +199,28 @@ class Runner:
         if getattr(self.model, "is_thread_safe", False):
             return "thread"
         return "sequential"
+
+    def _load_resume_items(self) -> List[Dict[str, Any]]:
+        """Load items.jsonl for resume. If shard file is missing (cleaned by
+        merge --cleanup), fall back to parent dir and filter by shard."""
+        items = load_jsonl(self.items_path)
+        if items:
+            return items
+        shard_id = self.cfg.get("shard_id")
+        num_shards = self.cfg.get("num_shards")
+        if shard_id is None or num_shards is None:
+            return items
+        parent_items = os.path.join(os.path.dirname(self.run_dir), "items.jsonl")
+        if not os.path.exists(parent_items):
+            return items
+        import hashlib
+        items = load_jsonl(parent_items)
+        items = [r for r in items
+                 if int(hashlib.md5((r.get("uid") or "").encode()).hexdigest(), 16)
+                 % int(num_shards) == int(shard_id)]
+        log.info("Resume from parent items.jsonl: %d records for shard %d/%d",
+                 len(items), int(shard_id), int(num_shards))
+        return items
 
     @staticmethod
     def _scan_items(items: List[Dict[str, Any]]) -> tuple[Set[str], Set[str], Set[str]]:

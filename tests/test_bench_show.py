@@ -33,8 +33,8 @@ def main():
     p.add_argument("--bench", default="daily_omni",
                    choices=("daily_omni", "omnibench", "omnivideobench", "worldsense"))
     p.add_argument("--index", type=int, default=1)
-    p.add_argument("--model-path", default="/apdcephfs_hldy/share_304318596/weiyangguo/models/Qwen2.5-Omni-7B")
-    p.add_argument("--gpus", default="0")
+    p.add_argument("--model-path", default="/apdcephfs_hldy/share_304318596/weiyangguo/models/Qwen2.5-Omni-3B")
+    p.add_argument("--gpus", default="0,1,2,3")
     args = p.parse_args()
 
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
@@ -65,16 +65,17 @@ def main():
         print(f"  答案: {s.answer}")
 
     # ── 复制媒体到 example/ ──
+    sub = os.path.join(EXAMPLE_DIR, f"{args.bench}_{args.index:04d}")
+    os.makedirs(sub, exist_ok=True)
     for m in s.media:
         src = m.path
         if not os.path.exists(src):
             print(f"  [{m.kind}] MISSING: {src}")
             continue
-        ext = os.path.splitext(src)[1]
-        dst = os.path.join(EXAMPLE_DIR, f"{args.bench}_{args.index:04d}_{m.kind}{ext}")
+        dst = os.path.join(sub, f"{m.kind}{os.path.splitext(src)[1]}")
         shutil.copy2(src, dst)
         size_mb = os.path.getsize(src) / 1024 / 1024
-        print(f"  [{m.kind}] {os.path.basename(src)} ({size_mb:.1f} MB) → example/{os.path.basename(dst)}")
+        print(f"  [{m.kind}] {os.path.basename(src)} ({size_mb:.1f} MB) → {os.path.relpath(dst, REPO_ROOT)}")
 
     # ── 构建 conversation（原生 transformers 方式） ──
     desc = media_description(s, dataset_cfg.get("modality", "av"))
@@ -118,7 +119,9 @@ def main():
         num_beams=1,
         do_sample=False,
     )
-    result = processor.batch_decode(text_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+    in_len = inputs["input_ids"].shape[1]
+    gen_ids = text_ids[0][in_len:] if isinstance(text_ids, tuple) else text_ids[:, in_len:]
+    result = processor.batch_decode(gen_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
     result = (result[0] if result else "").strip()
 
     print(f"\n{'=' * 60}")
