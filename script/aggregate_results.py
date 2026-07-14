@@ -19,11 +19,26 @@ RESULTS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__fil
 
 
 def parse_run_name(run_name: str):
-    """Parse '{model_name}_{backend}_{mode}' → (model, backend, mode)."""
-    # e.g. "Qwen2.5-Omni-7B_vllm_norm" → ("Qwen2.5-Omni-7B", "vllm", "norm")
-    # Handle quickcheck suffix: "Qwen2.5-Omni-7B_vllm_norm_quickcheck"
+    """Parse '{model_name}_{backend}_{mode}[_react][_quickcheck]'
+    → (model, backend, mode).
+
+    e.g. "Qwen2.5-Omni-7B_vllm_norm"       → ("Qwen2.5-Omni-7B", "vllm", "norm")
+         "OmniAgent-RL-7B_vllm_norm_react" → ("OmniAgent-RL-7B_ReAct", "vllm", "norm")
+
+    NOTE: "_react"/"_quickcheck" are suffixes appended by run.py AFTER the
+    base "{model}_{backend}_{mode}" name (see run.py's run_dir_name
+    construction) — they must be stripped BEFORE the rsplit("_", 2) below,
+    otherwise the split misaligns and swallows "backend" into "model"
+    (e.g. "OmniAgent-RL-7B_vllm" as model, "norm" as backend, "react" as
+    mode) and the run silently gets excluded from the pivoted 总表, which
+    only shows mode == "norm" rows.
+    """
     if run_name.endswith("_quickcheck"):
         run_name = run_name[:-len("_quickcheck")]
+
+    is_react = run_name.endswith("_react")
+    if is_react:
+        run_name = run_name[:-len("_react")]
 
     # Split from right: mode, backend, remaining = model
     parts = run_name.rsplit("_", 2)
@@ -36,6 +51,9 @@ def parse_run_name(run_name: str):
         model = run_name
         backend = "?"
         mode = "?"
+
+    if is_react:
+        model = f"{model}_ReAct"
     return model, backend, mode
 
 

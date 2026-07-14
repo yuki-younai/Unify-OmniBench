@@ -1,60 +1,66 @@
 #!/usr/bin/env bash
-# Unify-OmniBench launcher.
+# Unify-OmniBench launcher (Agent ReAct mode).
 #
-# Backends: transformer | vllm (本地GPU) | openai | openai-omni (API/服务端) | echo (smoke-test)
-# Datasets: daily_omni  omnibench  omnivideobench  worldsense（DATASETS=(a b) 可批量跑）
-# Modes: norm (直出答案) | cot (思维链，建议配合更大的 MAX_NEW_TOKENS)
-# 结果目录: results/<dataset>/<model_name>_<backend>_<mode>/
-#
-# 多 Worker 并行（vllm / transformer 后端）：
-#   GPUS_PER_WORKER=0（默认）→ 所有 GPU 给一个 worker，等同于单进程
-#   GPUS_PER_WORKER=2          → 4 张 GPU → 2 个 worker，每个独占 2 张 GPU
-#   样本按 hash(uid) % num_workers 分配，跑完自动合并 shard 结果
+# Backends: transformer | vllm (local GPU) | openai | openai-omni (API) | echo (smoke-test)
+# Datasets: daily_omni  omnibench  omnivideobench  worldsense  videomme
+# ReAct config: config/agent.yaml (max_steps, tools, etc.)
+# Output dir: results/<dataset>/<model_name>_<backend>_<mode>/
 
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7   
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export VLLM_DISABLE_PROGRESS_BAR=1
 export PYTHONPATH="$(cd "$(dirname "$0")" && pwd):${PYTHONPATH:-}"
-PYTHON=${PYTHON:-python}
+PYTHON=${PYTHON:-python3.12}
 
-BACKEND=vllm                               # openai | openai-omni | vllm | transformer | echo
-DATASETS=(daily_omni omnibench)                    # 支持多个：DATASETS=(daily_omni omnibench)
-INFER_MODE=norm                              # norm | cot
-RUN_MODE=react                              # direct | react
-MODEL_PATH=/apdcephfs_hldy/share_304318596/weiyangguo/models/Qwen2.5-Omni-3B    
-MODEL_NAME=Qwen2.5-Omni-3B                   # results/<DATASET>/<MODEL_NAME>_<BACKEND>_<MODE>/
-WORKERS=4                                    # batch_size；vllm 后端同时也是 max_num_seqs
-API_URL=http://localhost:8001/v1             # API server 地址（openai 模式用）
-API_KEY=                                     # 空=本地vLLM / 非空=公有云
-TEMPERATURE=0.0                              # 空 = 默认 (0.0)
-TOP_P=                                       # 空 = 默认
-MAX_NEW_TOKENS=4096                           # 空 = 默认 (10)
+# relax get_audio/get_clip ffprobe duration-tolerance check (see tools.py::VideoEnv)
+# — matches OmniAgent's examples/omniagent_eval/eval.sh
+export BYPASS_DURATION_CHECK=True
 
-# ── Agent ReAct 参数（其余在 config/agent.yaml） ──
-MAX_STEPS_OVERRIDE=${MAX_STEPS_OVERRIDE:-32}    # 覆盖最大步数（空=用 agent.yaml 默认 32）
+BACKEND=vllm
+DATASETS=(daily_omni  omnibench omnivideobench  worldsense videomme future_omni)
+INFER_MODE=norm
+RUN_MODE=react
 
-# ── 多 Worker 并行 ──
-GPUS_PER_WORKER=1                            # 0 = 所有 GPU 给一个 worker
-                                             # >0 = 每个 worker 独占 N 张 GPU
+#/apdcephfs_hldy/share_304318596/weiyangguo/models/Qwen2.5-Omni-3B
+#/apdcephfs_hldy/share_304318596/weiyangguo/models/OmniAgent-RL-7B
+MODEL_PATH=/apdcephfs_hldy/share_304318596/weiyangguo/models/OmniAgent-RL-7B
+MODEL_NAME=OmniAgent-RL-7B
+WORKERS=1                                    # vllm max_num_seqs (react benefits from higher concurrency)
+API_URL=http://localhost:8001/v1
+API_KEY=
+TEMPERATURE=0.0
+TOP_P=
+MAX_NEW_TOKENS=4096                           # react needs more tokens for multi-turn interaction
+
+# ── Multi-Worker ──
+GPUS_PER_WORKER=1                            # 0 = all GPUs for one worker, >0 = N GPUs per worker
+
 set -eo pipefail
 cd "$(dirname "$0")"
 
-# 清理残留 GPU 进程
+# cleanup leftover GPU processes
 fuser -k /dev/nvidia* 2>/dev/null || true
 sleep 2
 
-# 解析 GPU ID 列表
+# parse GPU ID list
 GPU_LIST=(${CUDA_VISIBLE_DEVICES//,/ })
 NUM_GPUS=${#GPU_LIST[@]}
 
 for DATASET in "${DATASETS[@]}"; do
-  echo "=== [$(date '+%H:%M:%S')] dataset=$DATASET mode=$INFER_MODE ==="
+  echo "=== [$(date '+%H:%M:%S')] dataset=$DATASET mode=$INFER_MODE run=$RUN_MODE ==="
 
-  RESULT_DIR="results/$DATASET/${MODEL_NAME}_${BACKEND}_${INFER_MODE}"
+  RESULT_DIR="results/$DATASET/${MODEL_NAME}_${BACKEND}_${INFER_MODE}_react"
+
+  # skip if already completed
+  if SKIP_MSG=$($PYTHON script/check_completed.py --result-dir "$RESULT_DIR" 2>/dev/null); then
+    echo "  [skip] already completed (accuracy=$SKIP_MSG) — skipping"
+    continue
+  fi
+
   mkdir -p "$RESULT_DIR"
 
-  # worker 数：GPU 后端按 GPUS_PER_WORKER 计算，其他后端固定 1
+  # worker count: GPU backends use GPUS_PER_WORKER, others fixed to 1
   IS_GPU_BACKEND=false
   if { [ "$BACKEND" = "vllm" ] || [ "$BACKEND" = "transformer" ]; }; then
     IS_GPU_BACKEND=true
@@ -99,11 +105,12 @@ for DATASET in "${DATASETS[@]}"; do
   done
 
   for pid in "${PIDS[@]}"; do
-    wait "$pid" || echo "WARNING: worker pid=$pid exited with code $?"
+    wait "$pid" && continue
+    echo "WARNING: worker pid=$pid exited with code $?"
   done
   echo "=== [$(date '+%H:%M:%S')] all $NUM_WORKERS workers done for $DATASET ==="
 
-  # 合并 shard 结果（仅多 worker 时需要）
+  # merge shard results (multi-worker only)
   if $IS_GPU_BACKEND; then
     $PYTHON script/merge_shards.py \
       --result-dir "$RESULT_DIR" \
@@ -114,7 +121,7 @@ for DATASET in "${DATASETS[@]}"; do
   fi
 done
 
-echo "=== 全部完成: ${DATASETS[*]} ==="
+echo "=== All done: ${DATASETS[*]} ==="
 
-# 自动生成 results/summary.md 聚合总表
+# auto-generate results/summary.md
 $PYTHON "$(dirname "$0")/script/aggregate_results.py"

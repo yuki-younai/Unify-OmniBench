@@ -1,526 +1,368 @@
-# Agent ReAct 测评迁移方案
+# Agent ReAct 模式设计与实现
 
-> 将 OmniAgent 的 OTA（Observation-Think-Action）Agent 循环迁移到 Unify-OmniBench，
-> 作为现有简单输入-输出测评的增强模式，后端复用现有 vllm/transformer/openai。
+本文档介绍 Unify-OmniBench 中 Agent ReAct 评测模式的完整工作流、架构设计及各模块细节，帮助理解模型如何通过多轮“观察→思考→行动”循环来完成视频理解多选题（MCQ）。
 
 ---
 
-## 1. 核心差异对比
+## 1. 概述
 
-| | 现有 Unify-OmniBench | OmniAgent ReAct |
+ReAct（Reasoning + Acting）模式下，模型不再一次性读取视频后直接输出答案（direct 模式），而是扮演一个 **Agent**，在有限的步数预算内主动调用工具探索视频内容：
+
+- **`get_frames`**：提取指定时间区间内的等距帧图片（视觉观察）
+- **`get_audio`**：提取指定时间区间的音频片段（听觉观察）
+- **`get_clip`**：提取指定时间区间的短视频片段（具备原始音轨的多模态观察）
+- **`answer`**：提交最终答案，结束该样本的推理循环
+
+每一轮 Agent 输出一个结构化 JSON，包含 `observation`（当前发现的总结）、`think`（推理与下一步决策）、`action`（工具调用或答案提交）。评测器执行工具、将结果反馈给模型，直至模型调用 `answer` 或达到最大步数上限。
+
+---
+
+## 2. 启动与配置
+
+### 2.1 入口脚本 `eval_react.sh`
+
+```bash
+bash eval_react.sh
+```
+
+关键变量（默认值）：
+
+| 变量 | 值 | 说明 |
 |---|---|---|
-| 推理模式 | 单次 `generate()` | 多轮迭代，每轮输出 JSON action |
-| 媒体输入 | 一次喂入全部视频+音频 | 按需请求片段（ffmpeg 实时裁剪） |
-| 上下文管理 | 固定 `system + user` | 多轮累积 + `[MEDIA OMITTED]` 记忆巩固 |
-| 工具调用 | 无 | 3 工具（get_frames / get_audio / get_clip）+ answer |
-| 并发 | batch / thread | 每 GPU 一个独立进程，JoinableQueue |
-| Batch 推理 | `generate_batch()` | 无 batch，逐条串行 |
-
----
-
-## 2. 总体架构
-
-```
-┌─────────────────────────────────────────────────────────┐
-│                      eval.sh                             │
-│  (已有，多 worker 分布式启动不变)                          │
-└──────────┬──────────────────────────────────────────────┘
-           │
-           ▼
-┌──────────────────────────────────────────────────────────┐
-│  run.py / Runner (现有)                                   │
-│    └── 新增: run_mode = "direct" | "react"               │
-└──────────┬──────────────────────────────────────────────┘
-           │
-           ├── run_mode=direct (现有逻辑，不变)
-           │
-           └── run_mode=react (新增)
-                   │
-                   ▼
-┌──────────────────────────────────────────────────────────┐
-│  ReActEvaluator (新模块: unify_omnibench/agent/)         │
-│                                                          │
-│  for sample in pending_samples:                           │
-│      env = VideoEnv(sample.media[0].path)                │
-│      messages = build_initial_prompt(sample, env.meta)   │
-│                                                          │
-│      for step in 1..max_steps:                           │
-│          raw = model.generate(messages)  ← 复用现有后端   │
-│          parsed = parse_action_json(raw)                  │
-│          if parsed.action == "answer":                    │
-│              end                                          │
-│          obs = env.execute(parsed.action)  ← 工具执行     │
-│          messages = append_turn(messages, raw, obs)       │
-│                                                          │
-│      persist_result(sample, steps, reward, history)      │
-└──────────────────────────────────────────────────────────┘
-```
-
-**关键设计原则**：
-- **后端完全复用**：`model.generate(req)` 的调用方式和现有 Runner 一致，不做任何修改
-- **Runner 新增模式开关**：`run_mode=direct` 走老逻辑，`run_mode=react` 走 Agent 循环
-- **工具系统独立**：放在 `unify_omnibench/agent/tools.py`，不污染现有代码
-
----
-
-## 3. 新增模块设计
-
-### 3.1 目录结构
-
-```
-unify_omnibench/
-├── agent/                      # ★ 新增
-│   ├── __init__.py
-│   ├── react_evaluator.py      # 核心 Agent 循环
-│   ├── tools.py                # 工具实现（get_frames, get_audio, get_clip）
-│   ├── action_parser.py        # JSON 解析 + action 验证
-│   ├── video_env.py            # 视频环境（ffprobe, ffmpeg）
-│   └── prompt.py               # ReAct system prompt 模板
-├── runner.py                   # 修改：新增 run_mode 分支
-├── core/types.py               # 修改：新增 ReactResult 类型
-├── config/
-│   └── dataset_config.yaml     # 修改：新增 react 相关配置
-```
-
-### 3.2 核心循环 — `react_evaluator.py`
-
-```python
-class ReActEvaluator:
-    def __init__(self, dataset, model, cfg):
-        self.dataset = dataset
-        self.model = model
-        self.cfg = cfg
-        self.max_steps = cfg.get("react", {}).get("max_steps", 32)
-        self.tools = ToolRegistry()   # 注册 get_frames / get_audio / get_clip
-
-    def run(self) -> Dict[str, Any]:
-        self.model.load()
-        all_samples = list(self.dataset)
-        done_uids = self._load_done_uids()  # 复用 Runner 的断点续跑逻辑
-
-        for sample in all_samples:
-            if sample.uid in done_uids:
-                continue
-            result = self._evaluate_one(sample)
-            self._persist(result)
-
-        return write_summary(...)
-
-    def _evaluate_one(self, sample) -> ReActResult:
-        video_path = self._find_video(sample.media)  # 取第一个 video MediaRef
-        env = VideoEnv(video_path)
-
-        # 构建初始 prompt（含视频元数据和题目）
-        system_prompt = self._build_system_prompt()
-        user_prompt = self._build_user_prompt(sample, env.meta())
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user",   "content": user_prompt},
-        ]
-
-        history = []
-        total_reward = 0.0
-        for step in range(1, self.max_steps + 1):
-            # 1. 调用模型（复用现有后端！）
-            raw = self.model.generate(InferenceRequest(
-                sample=self._make_chat_sample(messages),  # 把 messages 包装为 Sample
-                modality_mode="text",                     # media 已内嵌在 messages 中
-                prompt_template=None,
-                generation_kwargs={"max_new_tokens": 2048},
-            ))
-
-            # 2. 解析 JSON action
-            parsed = parse_action_json(raw)
-            history.append({"step": step, "raw": raw, "parsed": parsed})
-
-            # 3. 执行工具 / 提交答案
-            if parsed.action_type == "answer":
-                reward = env.score_answer(sample, parsed.content)
-                total_reward = reward
-                break
-
-            obs_text = self.tools.execute(parsed.action, env)
-
-            # 4. 记忆巩固：追加 assistant + user(observation) 到 messages
-            messages.append({"role": "assistant", "content": raw})
-            messages.append({"role": "user", "content": obs_text})
-
-            # 5. 替换旧媒体为占位符（节省上下文）
-            self._consolidate_memory(messages)
-
-        return ReActResult(
-            uid=sample.uid, dataset=sample.dataset,
-            steps=len(history), reward=total_reward,
-            answer=parsed.content if parsed.action_type == "answer" else None,
-            history=history,
-        )
-```
-
-### 3.3 工具系统 — `tools.py`
-
-```python
-class VideoEnv:
-    """视频环境：ffprobe 探测 + ffmpeg 裁剪 + 执行 action"""
-    def __init__(self, video_path):
-        self.video_path = video_path
-        self.meta = self._probe()        # duration, fps, has_audio
-        self.tmp_dir = tempfile.mkdtemp()
-        self.step_counter = 0
-
-    def meta(self) -> dict:
-        return self.meta
-
-    def execute(self, action: dict) -> tuple[str, list[MediaRef]]:
-        """执行 action，返回 (observation_text, new_media_refs)"""
-        self.step_counter += 1
-        typ = action["type"]
-        if typ == "get_frames":
-            frames = self._get_frames(action["start"], action["end"], action.get("num", 10))
-            return f"[Frames {action['start']:.1f}s-{action['end']:.1f}s (num={len(frames)})]", frames
-        elif typ == "get_audio":
-            audio = self._get_audio(action["start"], action["end"])
-            return f"[Audio {action['start']:.1f}s-{action['end']:.1f}s]", [audio]
-        elif typ == "get_clip":
-            clip = self._get_clip(action["start"], action["end"])
-            return f"[Clip {action['start']:.1f}s-{action['end']:.1f}s]", [clip]
-
-    # 底层用 subprocess 调 ffmpeg（与 OmniAgent 完全一致）
-    def _get_frames(self, start, end, num): ...
-    def _get_audio(self, start, end): ...
-    def _get_clip(self, start, end): ...
-```
-
-### 3.4 工具详情：输出格式与音视频模式
-
-Agent 每轮调用工具后，工具产出的媒体文件会以内联 content block 的形式追加到下一轮对话的 user message 中。**Agent 模式不使用 `use_audio_in_video` 配置**——每轮输入是动态构建的多模态数组，视频/音频/图片可以任意混排。
-
-#### 3.4.1 `get_frames` — 提取关键帧
-
-```
-ffmpeg -ss <start> -i <video> -frames:v 1 -q:v 2 <ts>.jpg  (逐帧)
-```
-
-| 属性 | 说明 |
-|---|---|
-| 输出格式 | 多张 JPEG 图片 |
-| 帧数上限 | `max_frames_len`（默认 60） |
-| 输入给模型的格式 | `{"type": "image", "image": "/tmp/agent_xxx/step_N/0.000.jpg"}` 多个 image block |
-
-**音视频模式**：纯视觉，不涉及音频。等效于 OmniBench 的图片输入模式。
-
-#### 3.4.2 `get_audio` — 提取音频片段
-
-```
-ffmpeg -ss <start> -i <video> -t <dur> -map 0:a:0? -vn -ac 1 -ar 16000 audio.wav
-```
-
-| 属性 | 说明 |
-|---|---|
-| 输出格式 | 单声道 16kHz WAV 音频 |
-| 时长上限 | `max_audio_len`（默认 300s） |
-| 输入给模型的格式 | `{"type": "audio", "audio": "/tmp/agent_xxx/step_N/audio.wav"}` 单个 audio block |
-
-**音视频模式**：纯音频独立输入。等效于 Daily-Omni/OmniBench 的"双路并列"模式中独立音频流那一路——音频从视频容器音轨按时间戳裁剪出来，作为独立 stream 发送，不走 `use_audio_in_video=True` 的交织编码。
-
-#### 3.4.3 `get_clip` — 提取视频片段
-
-```
-ffmpeg -ss <start> -i <video> -t <dur> -map 0:v:0? -map 0:a:0? -c copy clip.mp4
-```
-
-| 属性 | 说明 |
-|---|---|
-| 输出格式 | 含视频轨 + 音频轨的 MP4 片段（流拷贝，无需重编码） |
-| 时长上限 | `max_clip_len`（默认 60s） |
-| 输入给模型的格式 | `{"type": "video", "video": "/tmp/agent_xxx/step_N/clip.mp4"}` 单个 video block |
-
-**音视频模式**：视频片段自带音轨，后续 `process_mm_info(conv, use_audio_in_video=True)` 按时间戳从片段容器中交织提取音视频。等效于 OmniVideoBench/WorldSense 的交织模式。
-
-#### 3.4.4 `answer` — 提交答案
-
-```
-{"type": "answer", "content": "A"}
-```
-
-不产生媒体，直接结束循环。答案格式与 direct 模式一致（MCQ 用大写字母）。
-
-#### 3.4.5 多轮对话中的媒体混排
-
-Agent 模式的核心特征是**动态多模态对话**——每轮 user message 可能同时包含多种媒体：
-
-```
-Turn 1: user = [text]                              # 纯文本（初始问题）
-Turn 2: user = [text, image×8]                     # get_frames 返回的 8 张图
-Turn 3: user = [text, audio]                       # get_audio 返回的音频
-Turn 4: user = [text, video]                       # get_clip 返回的视频片段
-Turn 5: user = [text]                              # 可能不再需要新媒体
-```
-
-这与 direct 模式的根本区别在于：
-- **Direct 模式**：一次喂入全部媒体（video + audio），固定格式
-- **Agent 模式**：逐步按需请求媒体，**每轮格式可能不同**，`use_audio_in_video` 的概念在此不适用——音频来自 `get_audio` 就是独立 stream，音视频来自 `get_clip` 就是交织 stream，完全由工具产出决定。
-
-详见 `react_evaluator.py` 第 140-150 行：
-```python
-# 追加工具产出的媒体到 user message
-for m in result.media:
-    if m.kind == "image":
-        messages[-1]["content"].append({"type": "image", "image": m.path})
-    elif m.kind == "audio":
-        messages[-1]["content"].append({"type": "audio", "audio": m.path})
-    elif m.kind == "video":
-        messages[-1]["content"].append({"type": "video", "video": m.path})
-```
-
-### 3.6 Prompt 模板 — `prompt.py`
-
-```python
-SYSTEM_PROMPT = """You are an AI agent with visual and audio perception capabilities.
-Your task is to answer a question about a video by actively exploring its content.
-
-Available tools (respond with exactly one JSON per turn):
-- {"type": "get_frames", "start": 0.0, "end": 10.0, "num": 8}
-- {"type": "get_audio", "start": 0.0, "end": 15.0}
-- {"type": "get_clip",  "start": 5.0, "end": 15.0}
-- {"type": "answer", "content": "A"}  ← submit final answer
-
-Response format (MUST be valid single-line JSON):
-{
-  "observation": "<summary of what you just perceived, with evidence tags>",
-  "think": "<reasoning: evidence review → gap analysis → deduction → next action>",
-  "confidence": <0.0-1.0>,
-  "action": <one of the tool types above>
-}
-
-Rules:
-- You CANNOT answer on the first step (must explore at least once).
-- Use [Frames Xs-Ys] / [Audio Xs-Ys] / [Clip Xs-Ys] tags to cite evidence.
-- Confidence < 0.9 → you likely need more evidence.
-- Previously viewed media is marked as [MEDIA OMITTED] to save context;
-  rely on your own observation summaries."""
-
-USER_TEMPLATE = """Video: duration={duration:.1f}s, fps={fps:.1f}, has_audio={has_audio}
-
-Question: {question}
-Options: {choices}
-(answer format: single capital letter A/B/C/D)"""
-```
-
----
-
-## 4. 与现有系统的集成
-
-### 4.1 `runner.py` 改动（最小化）
-
-```python
-class Runner:
-    def run(self) -> Dict[str, Any]:
-        if self.cfg.get("run_mode") == "react":
-            return self._run_react()
-        return self._run_direct()   # 现有逻辑不变
-
-    def _run_react(self):
-        from .agent.react_evaluator import ReActEvaluator
-        evaluator = ReActEvaluator(self.dataset, self.model, self.cfg)
-        return evaluator.run()
-
-    def _run_direct(self):
-        ...  # 现有 run() 逻辑，完全不动
-```
-
-### 4.2 `run.py` 改动
-
-```python
-p.add_argument("--run-mode", default="direct", choices=("direct", "react"))
-```
-
-### 4.3 `dataset_config.yaml` 改动
+| `BACKEND` | `vllm` | 推理后端（也支持 `transformer`） |
+| `DATASETS` | `(daily_omni omnibench)` | 待评测数据集列表 |
+| `RUN_MODE` | `react` | 固定位，传给 `run.py` |
+| `MAX_NEW_TOKENS` | `4096` | 生成 token 上限（react 需要更多预算） |
+| `TEMPERATURE` | `0.0` | 生成温度 |
+| `GPUS_PER_WORKER` | `1` | 每个 worker 使用的 GPU 数 |
+| `BYPASS_DURATION_CHECK` | `True` | 放宽 clip/audio 时长校验容差 |
+
+多 worker 分片逻辑与 `eval.sh` 完全一致：按 `md5(uid) % num_shards` 分配样本。
+
+### 2.2 Agent 配置文件 `config/agent.yaml`
 
 ```yaml
-react:
-  max_steps: 32
-  system_prompt: |
-    You are an AI agent ...  # ← 默认 ReAct system prompt
+default:
+  max_steps: 32          # 最大探索步数
+  max_frames_len: 60     # get_frames 单次最多提取帧数
+  max_audio_len: 300     # get_audio 单次最大秒数
+  max_clip_len: 60       # get_clip 单次最大秒数
+  dynamic_step: true     # 根据视频时长动态调整 max_steps
+  generation:
+    max_new_tokens: 4096
+    temperature: 1.0
 ```
 
-### 4.4 后端适配
-
-**关键：后端代码完全不需要改**。Agent 循环中每一轮都调用 `model.generate(req)`，和现有逻辑一致。唯一的区别是 `modality_mode` 可能从 `"av"` 变为 `"text"`（当媒体已内嵌在 `messages` 的 content 中时）。
-
-对于 `openai_chat` 后端：`build_messages()` 需要新增一个模式——当 `req` 中已经包含预构建的 `messages` 时，直接透传而不重新拼装。加一个 `req.prefab_messages: Optional[List[Dict]]` 字段即可。
-
-### 4.5 断点续跑
-
-完全复用现有逻辑：`_load_done_uids()` 从 `items.jsonl` 读已完成样本 uid，已成功的跳过。Agent 中间步的失败不计入 done（只计入 done 的条件是最终 submit answer 且无 error）。
+按 benchmark 可单独覆盖（`benchmarks:` 下的同名 key）。
 
 ---
 
-## 5. 实施步骤
+## 3. 整体流程图
 
-| 阶段 | 改动 | 风险 |
-|---|---|---|
-| **Phase 1** | 新建 `unify_omnibench/agent/` 模块，实现 `VideoEnv` + 工具 + `ReActEvaluator` | 纯新增模块，不影响现有功能 |
-| **Phase 2** | `runner.py` 加 `run_mode` 分支，`run.py` 加 `--run-mode` 参数 | 改动 10 行，`direct` 默认路径不变 |
-| **Phase 3** | `InferenceRequest` 加 `prefab_messages` 字段，`openai_chat.py` 适配 | 向后兼容，默认 None |
-| **Phase 4** | `eval.sh` 支持 `RUN_MODE=react`，`aggregate_results.py` 支持 Agent 指标 | 纯新增 |
+```
+┌───────────────────────────────────────────────────────────────────┐
+│  eval_react.sh                                                    │
+│  ├─ 检查已完成 benchmark（check_completed.py）                      │
+│  ├─ 多 worker 启动 run.py（GPU 分片）                              │
+│  ├─ 等待所有 worker 完成                                          │
+│  ├─ merge_shards.py 合并分片结果                                  │
+│  └─ aggregate_results.py 生成 summary.md                          │
+└───────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌───────────────────────────────────────────────────────────────────┐
+│  run.py                                                           │
+│  ├─ 读取 config/agent.yaml → agent_cfg                            │
+│  ├─ 根据 benchmark 合并默认+特定配置                                │
+│  ├─ 动态调整 limit_mm_per_prompt（image 上限 = max_frames_len）     │
+│  ├─ 设置 run_dir（追加 _react 后缀）                               │
+│  └─ 创建 ReActEvaluator 并调用 .run()                             │
+└───────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌───────────────────────────────────────────────────────────────────┐
+│  ReActEvaluator.run()                                            │
+│  ├─ model.load()                                                 │
+│  ├─ 断点续跑：_load_resume_items() → _scan_items()                │
+│  ├─ 分片过滤、task_type 过滤、--limit 截断                       │
+│  ├─ 逐样本 _evaluate_one()（带 ProgressManager 进度条）           │
+│  ├─ _persist() 写入 + save_trajectory() 轨迹保存                  │
+│  ├─ model.close()                                                │
+│  ├─ 二次 _compact_items() 去重                                   │
+│  └─ write_summary() 生成统计                                     │
+└───────────────────────────────────────────────────────────────────┘
+```
 
 ---
 
-## 6. 复用与不迁移的内容
+## 4. 单样本评测循环 `_evaluate_one()`
 
-| 复用（直接搬） | 不迁移 |
+核心多轮 Agent 循环的逐步流程：
+
+### 4.1 初始化
+
+```
+1. 从 Sample.media 中查找视频文件（_find_video）
+2. 创建 VideoEnv(video_path)：
+   - ffprobe 探测 duration / fps / has_audio
+   - 创建临时目录存储工具输出的媒体文件
+   - 读取环境变量 BYPASS_DURATION_CHECK 设置时长校验容差
+3. 动态步数计算（dynamic_step）：
+   max_steps = min(cfg_max_steps, 5 + int(duration / max_clip_len))
+   - 更长视频分配更多探索步数
+4. 构建初始 messages：
+   [system]  → build_system_prompt()
+   [user]    → "Video META: ... \n Question: ... \n Options: ..."
+   [user]    → [NOTICE] 步数提示
+```
+
+### 4.2 逐轮循环（最多 max_steps 轮）
+
+```
+for step in 1 .. max_steps:
+  ┌─ 1) 调用模型 _call_model(messages)
+  │     └─ 将 messages 直传给 vLLM backend（不重新 build_messages）
+  │        vLLM 的 process_mm_info 自动提取内嵌图片/音频/视频
+  │
+  ├─ 2) 解析输出 parse_action_json(raw)
+  │     ├─ 去除 ```json``` fences
+  │     ├─ json.loads 提取 {observation, think, confidence, action}
+  │     ├─ action 字段归一化（字符串→dict）
+  │     └─ 防御性类型检查（confidence float, observation/think str）
+  │
+  ├─ 3) 若 action_type == "answer" → 评测结束
+  │     └─ 对比 answer.content vs sample.answer → is_correct
+  │
+  ├─ 4) 工具预验证 validate_action(action_type, action)
+  │     ├─ get_frames/audio/clip: start/end 必须是数值
+  │     ├─ get_frames: num 必须是 int
+  │     └─ answer: content 必须是 str
+  │     └─ 验证不通过 → 发送 [ERROR] INVALID_ACTION 消息，继续循环
+  │
+  ├─ 5) 执行工具 tool.execute(action, env)
+  │     ├─ get_frames → env.get_frames(start, end, num)
+  │     │   └─ ffmpeg 逐帧提取 jpg 图片
+  │     ├─ get_audio → env.get_audio(start, end)
+  │     │   ├─ NO_AUDIO 检查：!has_audio → 直接抛 ValueError
+  │     │   ├─ ffmpeg 提取 wav
+  │     │   └─ ffprobe 校验实际时长（dur_tol*5 容差）
+  │     └─ get_clip → env.get_clip(start, end)
+  │         ├─ ffmpeg copy 方式提取 mp4
+  │         └─ ffprobe 校验视频/音频时长（多级校验）
+  │     └─ 工具抛异常 → 捕获后发送 [ERROR] 消息，继续循环
+  │
+  ├─ 6) 追加消息到 messages：
+  │     [assistant] → raw（模型原始输出 JSON）
+  │     [user]      → 工具结果文本 + 内嵌媒体文件路径
+  │
+  ├─ 7) 记忆合并 _consolidate_memory(messages)
+  │     └─ 旧轮次 assistant 消息 → 文本占位符
+  │     └─ 旧轮次 user 消息图片/音频/视频 → 保留原 header 文本 + timestamps + 占位符
+  │     └─ 仅保留最新 user 消息的媒体块（防 OOM / 不超出 limit_mm_per_prompt）
+  │
+  └─ 8) 步数提示 _append_step_notice(messages)
+        └─ 剩余步数 ≤ 1 → "[NOTICE] FINAL STEP! You MUST provide your answer now."
+        └─ 否则 → "[NOTICE] Step X/Y. Z steps remaining."
+```
+
+### 4.3 超时/错误处理
+
+```
+- 达到 max_steps 且未调用 answer → _error_result("max_steps reached without answer")
+- 工具执行异常 → 追加 [ERROR] 文本消息，不影响其他步
+- 视频缺失 → 直接返回 _error_result("no video in sample media")
+- 模型输出不可解析（action_type="unknown"）→ parse_action_json 返回 unknown，
+  ToolRegistry.get("unknown") 返回 None，发送 [ERROR] UNKNOWN_TOOL
+```
+
+---
+
+## 5. 模块详解
+
+### 5.1 `prompt.py` — System & User Prompt
+
+**System Prompt 结构**（与 OmniAgent `video_env.py` 对齐，缩略为 MCQ-only）：
+
+```
+GLOBAL OPERATING RULES      — META 校验、音频约束、媒体持久化、策略效率等
+STRATEGIC INSPECTION GUIDELINES — 视觉搜索、时间二分、音频转录、多模态动作分析
+ACTIONS                     — 从 ToolRegistry 动态生成工具列表
+STRICT EXECUTION PROTOCOL   — 证据溯源、置信度、截止管理
+OUTPUT SCHEMA               — JSON 格式说明
+```
+
+**User Prompt 结构**（首条消息）：
+
+```
+Video META:
+- duration_seconds: 120.00   ← 向下截断不四舍五入
+- fps: 25.00
+- has_audio: True
+
+Question: What color is the car?
+Options:
+A. Red
+B. Blue
+C. Green
+D. Yellow
+When answering, set action.content to ONE uppercase letter (A, B, C, D).
+```
+
+### 5.2 `tools.py` — VideoEnv 与内置工具
+
+**VideoEnv（视频环境）**：
+
+| 属性/方法 | 说明 |
 |---|---|
-| ✅ OTA 循环逻辑 + 4 工具 | ❌ `multiprocessing` 生产者-消费者（我们已有 `eval.sh` 的多 worker 分片） |
-| ✅ JSON action 解析 | ❌ 视频预分段 + chunk 调度（OmniAgent 的特化逻辑，当前不需要） |
-| ✅ ffmpeg 视频处理命令 | ❌ `ModelManager`（我们用现有的 backend 体系） |
-| ✅ system prompt 模板 | ❌ DashScope LLM-as-Judge（FF 题型暂不支持，先用 MCQ 精确匹配） |
-| ✅ 记忆巩固机制 | ❌ Trajectory Collector（RL 训练相关，评测不需要） |
-| ✅ 自适应步数 | |
+| `video_path` | 视频文件路径 |
+| `tmp_dir` | 临时目录（`agent_xxx`），存储工具输出的 jpg/wav/mp4 |
+| `dur_tol` | 时长校验容差（BYPASS_DURATION_CHECK=true→99999，否则 1.0s） |
+| `_probe()` | ffprobe 探测 duration / fps / has_audio |
+| `_ffmpeg()` | 执行 ffmpeg，cwd=tmp_dir，按 step_counter 编号 |
+| `get_media_durations()` | ffprobe JSON 解析视频流/音频流实际时长 |
+| `get_frames(start, end, num)` | 等距帧提取 → 返回 `List[MediaRef("image")]` |
+| `get_audio(start, end)` | 音频提取 + 时长校验（dur_tol*5）→ `MediaRef("audio")` |
+| `get_clip(start, end)` | 视频切片 + 多级校验（视频/音视频同步）→ `MediaRef("video")` |
+
+**四大内置工具**（注册在 `ToolRegistry`）：
+
+| 工具 | schema | 关键校验 |
+|---|---|---|
+| `get_frames` | `{"type":"get_frames","start":0.0,"end":10.0,"num":8}` | num ≤ max_frames_len |
+| `get_audio` | `{"type":"get_audio","start":0.0,"end":15.0}` | !has_audio→ValueError; end ≤ start+max_audio_len; 时长校验 |
+| `get_clip` | `{"type":"get_clip","start":5.0,"end":15.0}` | end ≤ start+max_clip_len; 时长+音视频同步校验 |
+| `answer` | `{"type":"answer","content":"A"}` | content 必为字符串 |
+
+> **扩展性**：新增工具只需继承 `BaseTool` 并调用 `ToolRegistry.register()`，prompt 会自动包含新工具的 schema。
+
+### 5.3 `action_parser.py` — 模型输出解析
+
+**`parse_action_json(raw)`** 处理流程：
+
+1. 检测并剥离 ````json``` 代码块标记
+2. 正则提取最外层 `{...}` JSON
+3. `json.loads` 解析
+4. 防御性归一化：
+   - `action` 为字符串 → `{"type": action}`
+   - `action` 非 dict → `{}`
+   - `confidence` 无法转为 float → `0.0`
+   - `observation`/`think` 非 str → 空串
+
+**`validate_action(action_type, action)`** 执行前字段校验：
+
+- `get_frames`：`start`/`end` 必须为数值，`num` 必须为 int
+- `get_audio`/`get_clip`：`start`/`end` 必须为数值
+- `answer`：`content` 必须为 str
+
+### 5.4 `react_evaluator.py` — Agent 调度核心
+
+**`ReActEvaluator`** 负责完整的评测生命周期：
+
+```
+run()
+├─ model.load()
+├─ _compact_items()          # 去除上一轮重跑的重复记录
+├─ _load_resume_items()      # 断点续跑：加载 items.jsonl
+├─ _scan_items()             # 区分 done/retry uid
+├─ 分片过滤 / task_type 过滤 / --limit 截断
+├─ 进度条 ProgressManager
+├─ for each pending sample:
+│   └─ _evaluate_one()       # 单样本多轮 Agent 循环
+│       └─ _persist()        # 写入 items.jsonl + failed.jsonl + 轨迹保存
+├─ model.close()
+├─ _compact_items()          # 二次去重
+└─ write_summary()           # 统计准确率/breakdown
+```
+
+**`_consolidate_memory()` — 记忆合并机制**（对齐 OmniAgent 的 `_replace_old_media`）：
+
+| 步骤 | 操作 |
+|---|---|
+| assistant 消息（非最后轮） | `content` 替换为 `[{"type":"text","text":"[MEDIA OMITTED - Refer to your Observation]"}]` |
+| user 消息（非最后轮，含媒体） | 保留 header 文本 + timestamps 列表 → `"Frames 10.00s-20.00s Timestamps: [10.00s, 12.50s, ...] [MEDIA OMITTED ...]"` |
+| 最新 user 消息 | **保留完整媒体块**（图片/音频/视频路径） |
+
+> 此举确保长视频的多轮探索不会累积无限图片导致 OOM 或超出 vLLM 的 `limit_mm_per_prompt` 上限。
 
 ---
 
-## 7. 扩展性设计
+## 6. 与 Direct 模式的差异对齐
 
-### 7.1 工具插件注册机制
+| 维度 | Direct 模式 | ReAct 模式 |
+|---|---|---|
+| **推理后端** | `build_messages()` 从 Sample 构建一次性对话 | `req.messages` 直传多轮已构建的 messages |
+| **vLLM limit_mm_per_prompt** | `{"image":1,"video":1,"audio":1}` | `{"image":max_frames_len,"video":1,"audio":1}` |
+| **结果目录** | `results/<ds>/<model>_<backend>_norm/` | `results/<ds>/<model>_<backend>_norm_react/` |
+| **MAX_NEW_TOKENS** | 2048 | 4096 |
+| **system prompt** | 无（仅 user） | 完整的 Agent 行为准则（含工具列表） |
+| **温度** | `0.0` | `1.0`（促进探索多样性） |
 
-新增工具无需修改 `ReActEvaluator`，只需实现 `BaseTool` 并注册：
-
-```python
-# unify_omnibench/agent/tools.py
-
-class BaseTool(ABC):
-    """工具基类——新增工具只需继承并实现 execute + schema"""
-    name: str                          # "get_frames"
-    description: str                   # system prompt 中的工具描述
-    json_schema: Dict[str, Any]         # action 的 JSON schema（用于 prompt 生成 + 校验）
-
-    @abstractmethod
-    def execute(self, action: dict, env: "VideoEnv") -> ToolResult:
-        """执行工具，返回 (observation_text, media_refs, metadata)"""
-
-class ToolRegistry:
-    """插件式工具注册表"""
-    _tools: Dict[str, BaseTool] = {}
-
-    @classmethod
-    def register(cls, tool: BaseTool):
-        cls._tools[tool.name] = tool
-
-    @classmethod
-    def get(cls, name: str) -> BaseTool:
-        return cls._tools[name]
-
-    @classmethod
-    def build_system_prompt(cls) -> str:
-        """自动生成 tools 描述块，注入 system prompt"""
-        return "\n".join(f"- {t.json_schema}" for t in cls._tools.values())
-
-# ── 内置工具 ──
-ToolRegistry.register(GetFramesTool())
-ToolRegistry.register(GetAudioTool())
-ToolRegistry.register(GetClipTool())
-ToolRegistry.register(AnswerTool())
-
-# ── 扩展示例：新增一个字幕提取工具 ──
-class GetSubtitlesTool(BaseTool):
-    name = "get_subtitles"
-    description = "Extract embedded subtitles from a time range"
-    json_schema = {"type": "get_subtitles", "start": 0.0, "end": 30.0}
-
-    def execute(self, action, env):
-        text = env._extract_subtitles(action["start"], action["end"])
-        return ToolResult(f"[Subtitles {action['start']}s-{action['end']}s]: {text}", [])
-
-ToolRegistry.register(GetSubtitlesTool())   # ← 一行注册，system prompt 自动更新
-```
-
-### 7.2 Loop 策略接口
-
-Agent 循环逻辑可插拔，支持不同策略（标准 ReAct / Tree-of-Thought / 自定义）：
-
-```python
-# unify_omnibench/agent/loop_strategies.py
-
-class LoopStrategy(ABC):
-    """Agent 循环策略——新增循环逻辑只需实现此接口"""
-
-    @abstractmethod
-    def run(self, sample, model, env, tools: ToolRegistry, cfg: dict) -> ReActResult:
-        """执行一次完整的 Agent 循环，返回结果"""
-
-
-class ReActLoop(LoopStrategy):
-    """标准 ReAct 循环：逐轮调用模型→解析 action→执行工具→追加上下文"""
-    def run(self, sample, model, env, tools, cfg):
-        messages = self._build_init_messages(sample, env, tools)
-        for step in range(cfg.get("max_steps", 32)):
-            raw = self._generate(model, messages, cfg)
-            parsed = parse_action_json(raw)
-            if parsed.action_type == "answer":
-                return self._finalize(sample, parsed, step, messages)
-            result = tools.get(parsed.action_type).execute(parsed.action, env)
-            self._append_turn(messages, raw, result)
-            self._consolidate_memory(messages)
-        return self._timeout_result(sample, messages)   # 超步数未作答
-
-
-class TreeOfThoughtLoop(LoopStrategy):
-    """ToT 循环：每步生成 3 个候选 action，选择最优路径"""
-    def run(self, sample, model, env, tools, cfg): ...
-
-
-class ReActEvaluator:
-    def __init__(self, dataset, model, cfg):
-        ...
-        strategy_name = cfg.get("react", {}).get("loop_strategy", "react")
-        self.loop = LOOP_REGISTRY[strategy_name]()   # ← 按配置选择策略
-```
-
-### 7.3 Action 解析器插件
-
-不同 prompt 模板可能输出不同 JSON 格式，解析器也可插拔：
-
-```python
-class ActionParser(ABC):
-    @abstractmethod
-    def parse(self, raw: str) -> ParsedAction: ...
-
-class DefaultOTAParser(ActionParser):
-    """解析 OmniAgent 标准 OTA JSON"""
-    def parse(self, raw): ...
-
-class CustomParser(ActionParser):
-    """自定义解析逻辑"""
-    def parse(self, raw): ...
-```
-
-### 7.4 配置驱动
-
-所有扩展点通过 `dataset_config.yaml` 控制，无需改代码：
-
-```yaml
-daily_omni:
-  react:
-    enabled: true
-    loop_strategy: react          # react | tree_of_thought | custom
-    max_steps: 32
-    tools:                        # 启用哪些工具
-      - get_frames
-      - get_audio
-      - get_clip
-      - answer
-    system_prompt: |
-      You are an AI agent...
-    generation:
-      max_new_tokens: 2048
-      temperature: 0.0
-```
+> 断点续跑、分片、merge、summary 统计等运维逻辑与 direct 模式完全一致。
 
 ---
 
-## 8. 风险与注意事项
+## 7. 轨迹保存（Trajectory）
 
-1. **显存压力**：Agent 循环中每步都可能新增媒体（裁剪的视频片段），多轮后 GPU 显存可能不足。建议 React 模式降低 `gpu_memory_utilization` 或限制 `max_steps`。
-2. **上下文爆炸**：当前 `max_model_len=32768`，多轮 + 内嵌媒体可能超限。记忆巩固（`[MEDIA OMITTED]`）可缓解，但需要实际验证。
-3. **vLLM batch 模式**：Agent 循环是逐条串行的，无法利用 `generate_batch`。但可以在多 worker 层面并行（每个 worker 独立跑不同的样本）。
-4. **openai 后端**：需要通过 `prefab_messages` 字段透传预构建的 conversation，避免 `build_messages()` 重新编码媒体。
+每个样本的完整推理过程会保存为两种格式：
+
+### 7.1 OpenAI Messages 格式 JSON
+
+路径：`trajectories/<uid>.json`
+
+```json
+[
+  {"role": "system", "content": [{"type": "text", "text": "..."}]},
+  {"role": "user", "content": [{"type": "text", "text": "Video META: ..."}]},
+  {"role": "user", "content": [{"type": "text", "text": "[NOTICE] Step 0/8..."}]},
+  {"role": "assistant", "content": "{\"observation\":\"...\",\"action\":{...}}"},
+  ...
+]
+```
+
+> 媒体路径会被 `_sanitize_messages()` 替换为 basename，避免泄露绝对路径。
+
+### 7.2 HTML 可视化
+
+路径：`trajectories/<uid>.html`
+
+一个自包含的 HTML 页面，呈现：
+- 题目、选项、正确答案/模型答案标记
+- 每步的 raw JSON 输出（可折叠查看）
+- 错误步的警告标识
+- 最终结果 badge（Correct/Incorrect/ERROR）
+
+**注意**：对话紧凑化（`_consolidate_memory`）后的中轮消息会被标记为 `[MEDIA OMITTED]`，轨迹快照在 **answer 之前** 或 **max_steps 耗尽时** 截取，因此 HTML 中可能看到已被合并的消息。完整原始的媒体路径记录在 `items.jsonl` 的 `meta.history` 中。
+
+---
+
+## 8. 环境变量一览
+
+| 环境变量 | 作用 | 默认值 |
+|---|---|---|
+| `BYPASS_DURATION_CHECK` | 放宽 clip/audio ffprobe 时长校验容差 | `false`（eval_react.sh 设为 `True`） |
+| `MAX_STEPS_OVERRIDE` | 覆盖 agent.yaml 的 max_steps | 无 |
+| `VLLM_WORKER_MULTIPROC_METHOD` | vLLM worker 多进程模式 | `spawn` |
+| `CUDA_VISIBLE_DEVICES` | 可用 GPU 列表 | `0,1,2,3,4,5,6,7` |
+
+---
+
+## 9. 统计指标（Summary）
+
+`write_summary()` 生成的统计中，ReAct 模式额外包含：
+
+- **`meta.steps`**：每个样本实际使用的探索步数
+- **`meta.agent_confidence`**：Agent 提交 answer 时的置信度
+- **`meta.duration`**：视频时长
+- **breakdown 维度**：除 `task_type` 外，还可按步数区间、置信度区间统计
+
+---
+
+## 10. 关键设计决策
+
+1. **OmniAgent 完全对齐**：prompt 结构、工具校验（`validate_action`）、时长校验（`BYPASS_DURATION_CHECK` + `dur_tol`）、记忆合并（`_consolidate_memory`）、步数提示（`[NOTICE]`）、NO_AUDIO 保护、MediaRef 规范化——所有细节均参考 `OmniAgent/agent_system/environments/env_package/video_env.py` 实现。
+
+2. **防御性解析**：模型输出可能格式不规范（裸字符串、非 dict action、丢失字段），`parse_action_json` 做了五层兜底。
+
+3. **工具独立性**：VideoEnv 作为纯粹的视频环境，工具通过 ToolRegistry 插件式注册，新增工具无需修改 evaluator 或 prompt 模板。
+
+4. **运维健壮性**：断点续跑、分片合并、去重 compaction、失败自动重试、临时文件清理——这些与 direct 模式共享同一套基础设施。

@@ -2,7 +2,7 @@
 # Unify-OmniBench launcher.
 #
 # Backends: transformer | vllm (本地GPU) | openai | openai-omni (API/服务端) | echo (smoke-test)
-# Datasets: daily_omni  omnibench  omnivideobench  worldsense videomme（DATASETS=(a b) 可批量跑）
+# Datasets: daily_omni  omnibench  omnivideobench  worldsense videomme future_omni （DATASETS=(a b) 可批量跑）
 # Modes: norm (直出答案) | cot (思维链，建议配合更大的 MAX_NEW_TOKENS)
 # 结果目录: results/<dataset>/<model_name>_<backend>_<mode>/
 #
@@ -18,12 +18,12 @@ export VLLM_DISABLE_PROGRESS_BAR=1
 export PYTHONPATH="$(cd "$(dirname "$0")" && pwd):${PYTHONPATH:-}"
 PYTHON=${PYTHON:-python3.12}
 
-BACKEND=transformer                               # openai | openai-omni | vllm | transformer | echo
-DATASETS=(daily_omni  omnibench omnivideobench  worldsense videomme)                    # 支持多个：DATASETS=(daily_omni omnibench)
+BACKEND=vllm                          # openai | openai-omni | vllm | transformer | echo
+DATASETS=(daily_omni omnivideobench  worldsense videomme future_omni)                    # 支持多个：DATASETS=(daily_omni omnibench)
 INFER_MODE=norm                              # norm | cot
 RUN_MODE=direct                              # direct | react
-MODEL_PATH=/apdcephfs_hldy/share_304318596/weiyangguo/models/Qwen2.5-Omni-7B    
-MODEL_NAME=Qwen2.5-Omni-7B                   # results/<DATASET>/<MODEL_NAME>_<BACKEND>_<MODE>/
+MODEL_PATH=/apdcephfs_hldy/share_304318596/weiyangguo/models/Qwen2.5-Omni-3B    
+MODEL_NAME=Qwen2.5-Omni-3B                   # results/<DATASET>/<MODEL_NAME>_<BACKEND>_<MODE>/
 WORKERS=1                                    # batch_size；vllm 后端同时也是 max_num_seqs
 API_URL=http://localhost:8001/v1             # API server 地址（openai 模式用）
 API_KEY=                                     # 空=本地vLLM / 非空=公有云
@@ -34,7 +34,6 @@ MAX_NEW_TOKENS=512                           # 空 = 默认 (10)
 # ── Multi-Worker ──
 GPUS_PER_WORKER=1                            # 0 = all GPUs for one worker
                                              # >0 = N GPUs per worker
-
 set -eo pipefail
 cd "$(dirname "$0")"
 

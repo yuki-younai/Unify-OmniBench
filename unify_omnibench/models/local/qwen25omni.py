@@ -89,6 +89,12 @@ class Qwen25OmniModel(BaseModel):
         # （均为噪音，不影响正确性）。
         _logging.getLogger("qwen_omni_utils").setLevel(_logging.ERROR)
         _warnings.filterwarnings("ignore", category=FutureWarning, module="librosa.*")
+        # 压掉 Qwen2_5OmniProcessor 的 "System prompt modified, audio output
+        # may not work as expected" 警告——Agent ReAct 模式的 system prompt
+        # 本来就不是默认值（且我们从不需要模型输出音频），刷屏无意义。
+        _logging.getLogger(
+            "transformers.models.qwen2_5_omni.processing_qwen2_5_omni"
+        ).setLevel(_logging.ERROR)
 
         import torch  # noqa: F401
         from transformers import (  # type: ignore
@@ -137,10 +143,13 @@ class Qwen25OmniModel(BaseModel):
 
     def generate(self, req: InferenceRequest) -> str:
         import torch
-        conv, _ = build_messages(
-            req.sample, req.modality_mode,
-            user_template=req.prompt_template or "",
-            system=req.system_prompt or "",
+        if req.messages is not None:
+            conv = req.messages
+        else:
+            conv, _ = build_messages(
+                req.sample, req.modality_mode,
+                user_template=req.prompt_template or "",
+                system=req.system_prompt or "",
             use_audio_in_video=self.use_audio_in_video,
             video_kwargs=self.video_kwargs,
         )
@@ -190,12 +199,15 @@ class Qwen25OmniModel(BaseModel):
 
         texts, all_audios, all_images, all_videos = [], [], [], []
         for req in reqs:
-            conv, _ = build_messages(
-                req.sample, req.modality_mode,
-                user_template=req.prompt_template or "",
-                system=req.system_prompt or "",
-                use_audio_in_video=self.use_audio_in_video,
-                video_kwargs=self.video_kwargs,
+            if req.messages is not None:
+                conv = req.messages
+            else:
+                conv, _ = build_messages(
+                    req.sample, req.modality_mode,
+                    user_template=req.prompt_template or "",
+                    system=req.system_prompt or "",
+                    use_audio_in_video=self.use_audio_in_video,
+                    video_kwargs=self.video_kwargs,
             )
             texts.append(
                 self.processor.apply_chat_template(conv, add_generation_prompt=True, tokenize=False)

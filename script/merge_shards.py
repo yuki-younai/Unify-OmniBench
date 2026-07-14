@@ -86,6 +86,24 @@ def main() -> None:
     summary = write_summary(items_path, out_dir=parent, dataset_name=args.dataset)
     print(f"  [merge] total={summary['total']} accuracy={summary['accuracy']:.2%}")
 
+    # Merge per-shard trajectory files (Agent ReAct mode) into the parent
+    # trajectories/ dir BEFORE cleanup — otherwise --cleanup's rmtree()
+    # below silently deletes every shard's trajectories/*.json / *.html
+    # with no trace, since items.jsonl only stores the parsed answer/
+    # history, not the saved-trajectory file paths.
+    traj_out = os.path.join(parent, "trajectories")
+    n_traj = 0
+    for i in range(args.num_shards):
+        shard_traj = os.path.join(parent, f"shard_{i}", "trajectories")
+        if not os.path.isdir(shard_traj):
+            continue
+        os.makedirs(traj_out, exist_ok=True)
+        for fname in os.listdir(shard_traj):
+            shutil.copy2(os.path.join(shard_traj, fname), os.path.join(traj_out, fname))
+            n_traj += 1
+    if n_traj:
+        print(f"  [merge] trajectories: copied {n_traj} files from shards into {traj_out}")
+
     if args.cleanup:
         for i in range(args.num_shards):
             d = os.path.join(parent, f"shard_{i}")

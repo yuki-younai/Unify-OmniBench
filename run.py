@@ -114,16 +114,39 @@ def main(argv=None) -> None:
         # max_num_seqs（vLLM 引擎真实并发上限）直接跟 --workers 走同一个值，
         # 跟下面 concurrency.batch_size 天然一致，不用单独维护。
         model_cfg["max_num_seqs"] = args.workers
+        if args.run_mode == "react":
+            # ReAct mode accumulates many images from a single get_frames
+            # tool call (up to config/agent.yaml's max_frames_len, default
+            # 60) inside ONE prompt. Direct mode only ever has 1 image, so
+            # only raise the cap for react to avoid masking real bugs there.
+            # video/audio stay at 1 (matches OmniAgent's video_env.py:
+            # each get_clip/get_audio call produces exactly one clip/audio,
+            # and _consolidate_memory/_replace_old_media already ensures
+            # only the LATEST turn's media survives in the prompt).
+            agent_cfg_for_dataset = get_agent_cfg(args.dataset)
+            frames_limit = int(agent_cfg_for_dataset.get("max_frames_len", 60))
+            model_cfg["limit_mm_per_prompt"] = {
+                "image": max(frames_limit, 1),
+                "video": 1,
+                "audio": 1,
+            }
     if args.api_url:
         model_cfg["base_url"] = args.api_url
     if args.api_key:
         model_cfg["api_key"] = args.api_key
 
     model_name = args.model_name or args.backend
-    # results/<dataset>/<model_name>_<backend>_<mode>/；--limit/--task-type 抽查
-    # 加 _quickcheck 后缀，写到独立目录，不混进完整评测的 items.jsonl。
-    # shard worker 写到 shard_N/ 子目录，跑完由合并脚本聚合成父目录。
+    # results/<dataset>/<model_name>_<backend>_<mode>[_react][_quickcheck]/
+    # --run-mode react 必须加 "_react" 后缀，否则会跟同名的 direct 模式跑到
+    # 同一个 run_dir，互相覆盖/污染 items.jsonl（且跟 eval_react.sh 里
+    # RESULT_DIR="...${INFER_MODE}_react" 算出的路径对不上，导致
+    # check_completed.py / merge_shards.py 全部指向错误目录）。
+    # --limit/--task-type 抽查加 _quickcheck 后缀，写到独立目录，不混进
+    # 完整评测的 items.jsonl。shard worker 写到 shard_N/ 子目录，跑完由
+    # 合并脚本聚合成父目录。
     run_dir_name = f"{model_name}_{args.backend}_{args.mode}"
+    if args.run_mode == "react":
+        run_dir_name += "_react"
     if args.limit or args.task_type:
         run_dir_name += "_quickcheck"
     run_dir = os.path.join("results", args.dataset, run_dir_name)

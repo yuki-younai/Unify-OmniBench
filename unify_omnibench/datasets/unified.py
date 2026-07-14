@@ -25,6 +25,7 @@ _UNIFIED_FIELDS = ("id", "question", "choices", "answer", "video_path", "audio_p
 @register_dataset("omnivideobench")
 @register_dataset("worldsense")
 @register_dataset("videomme")
+@register_dataset("future_omni")
 class UnifiedAdapter(BaseDatasetAdapter):
     """Load any benchmark that's been converted to the unified JSON format."""
 

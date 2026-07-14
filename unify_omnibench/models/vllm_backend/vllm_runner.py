@@ -23,6 +23,7 @@ test: ``tests/test_qwen_omni_vllm.py``).
 from __future__ import annotations
 
 import gc
+import os
 from typing import Any, Dict, List
 
 from ...core.registry import register_model
@@ -58,6 +59,13 @@ class VLLMModel(BaseModel):
         self.mm_processor_cache_gb = float(cfg.get("mm_processor_cache_gb", 0))
         self.video_kwargs = self.parse_video_kwargs(cfg)
         self.use_audio_in_video = bool(cfg.get("use_audio_in_video", False))
+        # Agent ReAct mode accumulates multiple images/videos/audios across
+        # turns (e.g. get_frames returns up to max_frames_len images each
+        # call). Direct mode only ever has 1 of each. Configurable via
+        # vllm.yaml's limit_mm_per_prompt; falls back to a generous default.
+        default_limits = {"image": 1, "video": 1, "audio": 1}
+        self.limit_mm_per_prompt = dict(default_limits)
+        self.limit_mm_per_prompt.update(cfg.get("limit_mm_per_prompt", {}) or {})
         self.llm = None
         self.processor = None
 
@@ -68,6 +76,12 @@ class VLLMModel(BaseModel):
         _os.environ.setdefault("VLLM_DISABLE_PROGRESS_BAR", "1")
         _logging.getLogger("vllm").setLevel(_logging.ERROR)
         _logging.getLogger("qwen_omni_utils").setLevel(_logging.ERROR)
+        # 压掉 Qwen2_5OmniProcessor 的 "System prompt modified, audio output
+        # may not work as expected" 警告——Agent ReAct 模式的 system prompt
+        # 本来就不是默认值（且我们从不需要模型输出音频），刷屏无意义。
+        _logging.getLogger(
+            "transformers.models.qwen2_5_omni.processing_qwen2_5_omni"
+        ).setLevel(_logging.ERROR)
         _warnings.filterwarnings("ignore", category=FutureWarning, module="librosa.*")
 
         from transformers import Qwen2_5OmniProcessor  # type: ignore
@@ -94,7 +108,7 @@ class VLLMModel(BaseModel):
             max_model_len=self.max_model_len,
             dtype=self.dtype,
             seed=self.seed,
-            limit_mm_per_prompt={"image": 1, "video": 1, "audio": 1},
+            limit_mm_per_prompt=self.limit_mm_per_prompt,
             enforce_eager=self.enforce_eager,
             enable_prefix_caching=self.enable_prefix_caching,
             mm_processor_cache_gb=self.mm_processor_cache_gb,
@@ -181,13 +195,18 @@ class VLLMModel(BaseModel):
             gc.collect()
 
     def _build_one(self, req: InferenceRequest) -> Dict[str, Any]:
-        conv, _ = build_messages(
-            req.sample, req.modality_mode,
-            user_template=req.prompt_template or "",
-            system=req.system_prompt or "",
-            use_audio_in_video=self.use_audio_in_video,
-            video_kwargs=self.video_kwargs,
-        )
+        # Agent ReAct mode: use pre-built conversation messages directly
+        if req.messages is not None:
+            conv = req.messages
+            _sanitize_media_paths(conv)  # remove refs to missing temp files
+        else:
+            conv, _ = build_messages(
+                req.sample, req.modality_mode,
+                user_template=req.prompt_template or "",
+                system=req.system_prompt or "",
+                use_audio_in_video=self.use_audio_in_video,
+                video_kwargs=self.video_kwargs,
+            )
         text = self.processor.apply_chat_template(
             conv, add_generation_prompt=True, tokenize=False
         )
@@ -206,3 +225,29 @@ class VLLMModel(BaseModel):
             "multi_modal_data": mm_data,
             "mm_processor_kwargs": {"use_audio_in_video": self.use_audio_in_video},
         }
+
+
+def _sanitize_media_paths(conv: List[Dict[str, Any]]) -> None:
+    """Remove media entries whose files don't exist from conversation content.
+
+    In Agent ReAct mode, tools create temp files that may be missing by the
+    time vLLM's process_mm_info tries to read them (e.g. failed tool calls,
+    stale tmp dirs).  Drop them silently to avoid crash.
+    """
+    for msg in conv:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        kept = []
+        for block in content:
+            if not isinstance(block, dict):
+                kept.append(block)
+                continue
+            # Check image/video/audio file paths
+            for key in ("image", "video", "audio"):
+                path = block.get(key)
+                if path and isinstance(path, str) and not os.path.exists(path):
+                    break  # file missing → drop this block
+            else:
+                kept.append(block)
+        msg["content"] = kept

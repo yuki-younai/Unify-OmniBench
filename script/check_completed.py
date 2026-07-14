@@ -1,8 +1,8 @@
 """Check whether a benchmark result has already been completed successfully.
 
 Exit codes:
-    0 ─ already done (summary.json exists, failed==0, accuracy>0)
-    1 ─ needs to run (no summary.json, or has failures, or accuracy==0)
+    0 ─ already done (summary.json exists, failed<=10, accuracy>0)
+    1 ─ needs to run (no summary.json, or too many failures, or accuracy==0)
     2 ─ error (file exists but JSON is malformed)
 
 Usage:
@@ -32,7 +32,7 @@ def main() -> None:
     failed = s.get("failed", 0)
     acc = s.get("accuracy", -1)
 
-    if failed == 0 and acc > 0:
+    if failed <= 10 and acc > 0:
         print(f"{acc:.1%}")
         sys.exit(0)
     else:

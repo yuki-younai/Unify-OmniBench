@@ -43,6 +43,9 @@ class InferenceRequest:
     prompt_template: Optional[str] = None
     system_prompt: Optional[str] = None
     generation_kwargs: Dict[str, Any] = field(default_factory=dict)
+    # Pre-built conversation messages (used by Agent ReAct mode).
+    # When set, backends skip build_messages() and use these directly.
+    messages: Optional[List[Dict[str, Any]]] = None
 
 
 @dataclass
